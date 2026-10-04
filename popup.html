@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <style>
+    body { width: 320px; margin: 0; font: 13px/1.5 system-ui, Arial, sans-serif; padding: 12px; }
+    h1 { font-size: 14px; margin: 0 0 8px; }
+    label { display: block; margin: 6px 0; cursor: pointer; }
+    .row { display: flex; justify-content: space-between; gap: 8px; margin: 4px 0; }
+    .row b { font-weight: 600; text-align: right; }
+    .pill { display: inline-flex; align-items: center; gap: 6px; padding: 6px 11px; border-radius: 14px; color: #fff; font-weight: 700; margin: 6px 0; }
+    .b-red { background: #d92d20; }
+    .b-orange { background: #f79009; }
+    .b-yellow { background: #f5d908; color: #574a06; }
+    .b-green { background: #12b76a; }
+    .b-gray { background: #667085; }
+    .hint { color: #667085; font-size: 12px; margin-top: 8px; }
+    .off { color: #d92d20; }
+    button { margin-top: 8px; width: 100%; padding: 6px; border: 1px solid #d0d5dd; border-radius: 6px; background: #f2f4f7; cursor: pointer; font-size: 13px; }
+    button.primary { background: #175cd3; border-color: #175cd3; color: #fff; }
+    button:hover { filter: brightness(0.97); }
+    .row-btns { display: flex; gap: 8px; }
+    .row-btns button { flex: 1; margin-top: 8px; }
+    .row-btns button:disabled { opacity: .5; cursor: default; }
+    pre#diag-out { display: none; max-height: 240px; overflow: auto; background: #f2f4f7; border-radius: 6px; padding: 8px; font-size: 11px; white-space: pre-wrap; word-break: break-word; margin: 8px 0 0; }
+  </style>
+</head>
+<body>
+  <h1>АнтиСахар</h1>
+
+  <label><input type="checkbox" id="enabled" /> Расширение включено</label>
+  <label><input type="checkbox" id="markClean" /> Показывать зелёный значок (безопасно)</label>
+
+  <div id="status" class="hint">Связь со страницей...</div>
+  <div id="result" style="display:none">
+    <div id="pill" class="pill b-gray">…</div>
+    <div class="row"><span>Источник</span><b id="r-source">—</b></div>
+    <div class="row"><span>Кэш</span><b id="r-cache">—</b></div>
+    <div class="row" id="row-zones" style="display:none"><span>Найдено</span><b id="r-zones"></b></div>
+  </div>
+
+  <button id="rescan" class="primary">Перепроверить товар</button>
+  <button id="clearCache">Очистить кэш</button>
+  <div id="msg" class="hint"></div>
+  <div class="row-btns">
+    <button id="diag">Диагностика</button>
+    <button id="copy" disabled>Скопировать в буфер</button>
+  </div>
+  <pre id="diag-out"></pre>
+  <button id="options">Настройки...</button>
+  <div id="ver" class="hint" style="text-align:center"></div>
+
+  <script src="defaults.js"></script>
+  <script src="popup.js"></script>
+</body>
+</html>

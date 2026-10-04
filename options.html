@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <title>АнтиСахар — настройки</title>
+  <style>
+    body { font: 14px/1.5 system-ui, Arial, sans-serif; max-width: 760px; margin: 24px auto; padding: 0 16px; color: #1d2939; }
+    h1 { font-size: 20px; }
+    fieldset { border: 1px solid #d0d5dd; border-radius: 8px; margin: 16px 0; padding: 12px 16px 16px; }
+    legend { font-weight: 600; padding: 0 6px; }
+    label { display: block; margin: 6px 0; }
+    input[type=text], input[type=number], select, textarea {
+      width: 100%; box-sizing: border-box; padding: 6px 8px;
+      border: 1px solid #d0d5dd; border-radius: 6px; font: inherit; font-size: 13px;
+    }
+    textarea { font-family: Consolas, monospace; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .hint { color: #667085; font-size: 12px; margin: 4px 0 8px; }
+    .actions { display: flex; gap: 8px; margin-top: 16px; align-items: center; }
+    button { padding: 8px 16px; border-radius: 6px; border: 1px solid #d0d5dd; background: #f2f4f7; cursor: pointer; font-size: 14px; }
+    button.primary { background: #175cd3; border-color: #175cd3; color: #fff; }
+    #save-msg { color: #12b76a; font-weight: 600; }
+    pre#test-out { background: #f2f4f7; border-radius: 6px; padding: 10px; font-size: 12px; white-space: pre-wrap; word-break: break-word; min-height: 40px; }
+    .test-row { display: flex; gap: 8px; }
+    .test-row input { flex: 1; }
+    .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; vertical-align: baseline; }
+    .dot-red { background: #d92d20; }
+    .dot-orange { background: #f79009; }
+    .dot-yellow { background: #f5d908; }
+    .dot-green { background: #12b76a; }
+  </style>
+</head>
+<body>
+  <h1>АнтиСахар — настройки</h1>
+
+  <fieldset>
+    <legend>Общие</legend>
+    <label><input type="checkbox" id="enabled" /> Расширение включено</label>
+    <label><input type="checkbox" id="markClean" /> Показывать зелёный значок (безопасно)</label>
+    <label><input type="checkbox" id="preferComposition" /> Приоритет блока «Состав» (точнее, но если блока нет — берём «Описание»)</label>
+    <label>Если текста со страницы не хватило, догружать товар:</label>
+    <select id="fetchStrategy">
+      <option value="auto">Авто: запрос, при блокировке — скрытая вкладка</option>
+      <option value="fetch">Только запрос</option>
+      <option value="tab">Только скрытая вкладка</option>
+    </select>
+  </fieldset>
+
+  <fieldset>
+    <legend>Продовольственные категории</legend>
+    <div class="hint">Верхние категории товаров, которые оцениваем (одно на строку, совпадение подстроки). Товар из другой категории будет помечен «не продукты». Если категорию определить не удалось — товар оценивается.</div>
+    <textarea id="foodCategories" rows="3"></textarea>
+  </fieldset>
+
+  <fieldset>
+    <legend>Зоны риска (ключевые слова)</legend>
+    <div class="hint">Одно слово/фрагмент на строку, поиск без учёта регистра и внутри слов. Значок получает цвет САМОЙ ПЛОХОЙ зоны, где нашлось слово. E-коды ищутся и в кириллице (Е951 = e951).</div>
+    <label><i class="dot dot-red"></i>Красная зона — высокий риск (канцерогенность, токсичность, обычный сахар)</label>
+    <textarea id="zone-red" rows="5"></textarea>
+    <label style="margin-top:10px"><i class="dot dot-orange"></i>Оранжевая зона — обман и скрытые угрозы здоровью</label>
+    <textarea id="zone-orange" rows="5"></textarea>
+    <label style="margin-top:10px"><i class="dot dot-yellow"></i>Жёлтая зона — компромиссы (условно безопасные)</label>
+    <textarea id="zone-yellow" rows="6"></textarea>
+    <label style="margin-top:10px"><i class="dot dot-green"></i>Зелёная зона — безопасные</label>
+    <textarea id="zone-green" rows="5"></textarea>
+  </fieldset>
+
+  <fieldset>
+    <legend>Фильтры совпадений</legend>
+    <label>Слова-исключения (отменяют совпадение рядом с собой)</label>
+    <textarea id="excludes" rows="2"></textarea>
+    <div class="hint">Например «без сахара», «сахарозаменитель».</div>
+    <label style="margin-top:10px">Контекстные слова (вкус/аромат, а не состав)</label>
+    <textarea id="contextExcludes" rows="2"></textarea>
+    <div class="hint">Совпадение рядом с этими словами не считается: так отсеиваются вкусо-ароматические описания («медовые ноты», «привкус мёда») и похожие названия («сахарный колер» — это краситель). Слово ищется как отдельное слово, а не внутри других («ра-зно-травье» — не «ноты»), и действует только внутри одного пункта состава: «сахар, краситель сахарный колер» — сахар останется.</div>
+  </fieldset>
+
+  <fieldset>
+    <legend>Маркетплейсы</legend>
+    <div class="hint">Домены, на которых работает расширение. Поддомены учитываются автоматически: «ozon.ru» покрывает и «www.ozon.ru».</div>
+    <textarea id="hosts" rows="4"></textarea>
+  </fieldset>
+
+  <fieldset>
+    <legend>Селекторы (продвинуто)</legend>
+    <div class="hint">Дополнительные селекторы: <b>состава</b> (если блок «Состав» не находится автоматически) и <b>описания</b>. По одному на строку. JSON-LD, метатеги, подписи «Состав»/«Описание» и состояние страницы читаются всегда.</div>
+    <textarea id="sel-comp" rows="2" placeholder="селектор блока состава"></textarea>
+    <textarea id="sel-desc" rows="3"></textarea>
+  </fieldset>
+
+  <fieldset>
+    <legend>Проверка и кэш</legend>
+    <div class="test-row">
+      <input type="text" id="test-url" placeholder="https://www.ozon.ru/product/..." />
+      <button id="test-btn">Проверить</button>
+    </div>
+    <pre id="test-out"></pre>
+    <div class="actions" style="margin-top:8px">
+      <button id="clear-cache">Очистить кэш</button>
+      <span id="cache-info" class="hint"></span>
+    </div>
+  </fieldset>
+
+  <div class="actions">
+    <button id="save" class="primary">Сохранить</button>
+    <button id="reset">Сбросить к настройкам по умолчанию</button>
+    <span id="save-msg"></span>
+  </div>
+
+  <script src="defaults.js"></script>
+  <script src="options.js"></script>
+</body>
+</html>
