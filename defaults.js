@@ -3,10 +3,10 @@
 // (ТОП-22, обновление 03.10.2026). Описания рисков — в components.js.
 
 // Версия расширения: показывается в попапе и в диагностике
-const ASG_VERSION = '1.4.14';
+const ASG_VERSION = '1.4.16';
 
 // Версия структуры настроек. Меняется при обновлении критериев — тогда кэш сбрасывается.
-const ASG_CFG_VERSION = 6;
+const ASG_CFG_VERSION = 8;
 
 const ASG_DEFAULTS = {
   cfgVersion: ASG_CFG_VERSION,

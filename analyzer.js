@@ -26,6 +26,12 @@ function asgTranslit(t) {
 // слово получается «(без», и сравнение с исключением «без» не срабатывало.
 const ASG_WORD_RE = /[a-zа-яё0-9]+/gi;
 
+// «не содержит сахара», «не имеет сахара» — отрицание с глаголом перед
+// совпадением. В список слов-исключений «содержит» добавить нельзя: тогда
+// пропадало бы и «содержит мёд».
+const ASG_NEG_WORD = asgTranslit('не');
+const ASG_HAS_VERBS = ['содерж', 'содержащ', 'имеет'].map((w) => asgTranslit(w));
+
 // Отрицание перед совпадением: «без сахара», «без добавленного сахара»,
 // «без сахара и мёда». Проверяем до трёх слов непосредственно перед совпадением
 // и до границы фразы (запятая/точка с запятой). Широкий коридор был плох тем, что
@@ -40,6 +46,13 @@ function asgNegatedBefore(t, start, excludes) {
   for (const w of words) {
     for (const e of excludes) {
       if (w === e) return true;
+    }
+  }
+  // «не содержит сахара» — отрицание с глаголом перед совпадением
+  for (let i = 0; i + 1 < words.length; i++) {
+    if (words[i] !== ASG_NEG_WORD) continue;
+    for (const v of ASG_HAS_VERBS) {
+      if (words[i + 1].indexOf(v) === 0) return true;
     }
   }
   return false;
