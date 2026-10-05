@@ -8,6 +8,8 @@
   const BADGE_ATTR = 'asg-safety-badge';
   const PRODUCT_PATH_RE = /\/(product|catalog|card)\//i;
   const WATCH_MS = 20000; // окно наблюдения за до-рендером
+  const COMPOSE_WAIT_MS = 40000; // сколько ждём блок «Состав» после окна наблюдения
+  const COMPOSE_PROBE_MS = 1000; // как часто проверять появление состава в этом ожидании
   const POLL_MS = 400; // как часто проверяем, изменился ли текст
   const QUIET_MS = 1200; // столько страница должна быть «тихой» перед показом цвета
   const SETTLE_MS = 3000; // после этой тишины выборка считается финальной
@@ -40,6 +42,8 @@
   let lastGrowthAt = 0;
   let lastAnalyzedAt = 0;
   let watchUntil = 0;
+  let composeWaitUntil = 0;
+  let composeProbeAt = 0;
   let watching = false;
   let pollTimer = null;
   let recheckTimer = null;
@@ -52,6 +56,14 @@
   function rememberError(msg) {
     errors.push(new Date().toLocaleTimeString() + ' ' + String(msg).slice(0, 250));
     if (errors.length > 8) errors.shift();
+  }
+
+  // Заметки о ходе работы — отдельно от ошибок, чтобы в отчёте было видно,
+  // почему вердикт пересчитывался (например, блок «Состав» пришёл поздно).
+  const notes = [];
+  function rememberNote(msg) {
+    notes.push(new Date().toLocaleTimeString() + ' ' + String(msg).slice(0, 200));
+    if (notes.length > 8) notes.shift();
   }
 
   async function loadSettings() {
@@ -434,6 +446,29 @@ function isConfirmed(r) {
     }
     const now = Date.now();
     if (now > watchUntil) {
+      // Блок «Состав» на Ozon появляется позже основного текста. Если после
+      // окна наблюдения его всё ещё нет, вердикт навсегда остался бы посчитанным
+      // по описанию — а там маркетинговый текст, и он даёт ложные находки.
+      // Поэтому ждём состав ещё COMPOSE_WAIT_MS и пересчитываем, как только он
+      // появится. Проверка идёт раз в COMPOSE_PROBE_MS и только на тихой странице.
+      if (composeWaitUntil > now && !(lastExtract && lastExtract.hasComposition)) {
+        const len = bodyTextLen();
+        if (len > lastBodyLen) {
+          lastGrowthAt = now;
+          lastBodyLen = len;
+        }
+        if (now - composeProbeAt >= COMPOSE_PROBE_MS && isSettled()) {
+          composeProbeAt = now;
+          const fresh = asgExtractFromDoc(document, settings);
+          if (fresh.hasComposition) {
+            rememberNote('блок «Состав» появился после окна наблюдения — пересчёт по нему');
+            analyze(true, true);
+            stopWatch();
+            return;
+          }
+        }
+        return; // наблюдение продолжается, значок не трогаем
+      }
       // окно наблюдения истекло — финализируем: считаем, что состав уже пришёл
       if (!lastFinal) analyze(true, true);
       stopWatch();
@@ -465,7 +500,10 @@ if (!lastFinal && isSettled()) {
     fallbackTried = false;
     lastBodyLen = bodyTextLen();
     lastAnalyzedAt = Date.now();
+    lastGrowthAt = Date.now();
     lastFinal = false;
+    composeWaitUntil = Date.now() + WATCH_MS + COMPOSE_WAIT_MS;
+    composeProbeAt = 0;
     state = { status: 'pending' };
     updateBadge(true);
     analyze(false, false);
@@ -474,17 +512,35 @@ if (!lastFinal && isSettled()) {
 
   // --- диагностика ---
 
+  // Почему на этой странице расширение не работает. null — работает.
+  // Нужно, чтобы в отчёте не выглядело как «состав не найден», когда мы
+  // просто не анализируем страницу: например на github.com из нашего README
+  // проба находит слово «состав» в тексте про само расширение.
+  function inactiveReason() {
+    if (!settings || !settings.enabled) return 'расширение выключено в настройках';
+    if (!hostAllowed()) return 'сайт ' + location.hostname + ' не в списке разрешённых';
+    if (!isProductPage()) return 'страница не похожа на карточку товара';
+    return null;
+  }
+
   async function diagnose() {
     const s = settings || ASG_DEFAULTS;
-    const fresh = asgExtractFromDoc(document, s);
+    const reason = inactiveReason();
+    const fresh = reason ? null : asgExtractFromDoc(document, s);
     let cacheInfo = null;
     try {
       cacheInfo = await send({ type: 'cache-info' });
     } catch (e) { /* ignore */ }
     let probe = null;
-    try {
-      probe = asgProbeComposition(document);
-    } catch (e) { /* ignore */ }
+    if (!reason) {
+      // проба ищет слово «состав» по странице — это подсказка для настройки
+      // селекторов, а не результат анализа, и на нерелевантных страницах
+      // она только путает
+      try {
+        probe = asgProbeComposition(document);
+      } catch (e) { /* ignore */ }
+    }
+    const e = fresh || {};
     return {
       host: location.hostname,
       url: location.href,
@@ -492,22 +548,26 @@ if (!lastFinal && isSettled()) {
       enabled: !!(settings && settings.enabled),
       hostAllowed: hostAllowed(),
       productPage: isProductPage(),
-      topCategory: fresh.topCategory,
-      pageIsFood: fresh.topCategory ? isFoodCategory(fresh.topCategory) : null,
+      reason: reason,
+      topCategory: e.topCategory || null,
+      pageIsFood: e.topCategory ? isFoodCategory(e.topCategory) : null,
       extraction: {
-        hasComposition: !!fresh.hasComposition,
-        hasDescriptionBlock: !!fresh.hasDescriptionBlock,
-        confident: !!fresh.confident,
-        authoritative: !!fresh.authoritative,
-        compositionTier: fresh.compositionTier,
-        compositionCandidates: fresh.compositionCandidates,
-        compositionParts: fresh.compositionParts,
-        compositionWellFormed: !!fresh.compositionWellFormed,
-        ingredientListLike: !!fresh.ingredientListLike,
-        compositionLen: (fresh.composition || '').length,
-        compositionPreview: (fresh.composition || '').slice(0, 300),
-        descriptionLen: (fresh.description || '').length,
-        pageTextLen: (fresh.pageText || '').length
+        skipped: !!reason,
+        hasComposition: !!e.hasComposition,
+        hasDescriptionBlock: !!e.hasDescriptionBlock,
+        confident: !!e.confident,
+        authoritative: !!e.authoritative,
+        compositionTier: e.compositionTier || 0,
+        compositionCandidates: e.compositionCandidates || 0,
+        compositionParts: e.compositionParts || 0,
+        compositionWellFormed: !!e.compositionWellFormed,
+        ingredientListLike: !!e.ingredientListLike,
+        compositionLen: (e.composition || '').length,
+        compositionPreview: (e.composition || '').slice(0, 300),
+        descriptionLen: (e.description || '').length,
+        descriptionPreview: (e.description || '').slice(0, 300),
+        pageTextLen: (e.pageText || '').length,
+        pageTextPreview: (e.pageText || '').slice(0, 200)
       },
       result: state,
       resultConfirmed: isConfirmed(state),
@@ -519,7 +579,8 @@ if (!lastFinal && isSettled()) {
         markClean: settings && settings.markClean,
         foodCategories: (settings && settings.foodCategories) || []
       },
-      errors
+      errors,
+      notes
     };
   }
 
@@ -530,6 +591,7 @@ if (!lastFinal && isSettled()) {
       sendResponse({
         ok: true,
         active: !!(settings && settings.enabled) && hostAllowed(),
+        reason: inactiveReason(),
         host: location.hostname,
         productPage: isProductPage(),
         confirmed: isConfirmed(state),

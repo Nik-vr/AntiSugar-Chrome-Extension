@@ -111,7 +111,8 @@ function pickSource(product, s) {
   const max = s.maxDescChars || 20000;
 
   if (s.preferComposition !== false && comp.length >= 12) {
-    return { text: comp.slice(0, 2000), source: 'состав' };
+    // 4000, а не 2000: состав-ассорти с несколькими вкусами длиннее
+    return { text: comp.slice(0, 4000), source: 'состав' };
   }
   if (desc.length >= 60) {
     return { text: desc.slice(0, max), source: 'описание' };

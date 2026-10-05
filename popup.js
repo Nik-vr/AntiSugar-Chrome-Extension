@@ -111,6 +111,13 @@ document.addEventListener('DOMContentLoaded', async () => {
       els.result.style.display = 'none';
       return;
     }
+    if (st.reason) {
+      els.status.className = st.productPage && st.active ? 'hint off' : 'hint';
+      els.status.textContent =
+        st.reason.charAt(0).toUpperCase() + st.reason.slice(1) + ' — оценка не выполнялась.';
+      els.result.style.display = 'none';
+      return;
+    }
     if (!st.productPage) {
       els.status.className = 'hint';
       els.status.textContent = 'Открыта не страница товара — оценка не требуется.';

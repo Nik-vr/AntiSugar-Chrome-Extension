@@ -26,6 +26,11 @@ const ASG_COMPOSITION_LABEL =
 const ASG_DESCRIPTION_LABEL = /^\s*(описани[ея]|описание\s+товара|description)\s*[:—-]?\s*$/i;
 
 const ASG_MAX_COMPOSITION = 1500;
+// Состав может быть длинным — ассорти с четырьмя вкусами легко переваливает за
+// полторы тысячи символов. Для значения, стоящего рядом с подписью «Состав»,
+// разрешаем больше; «далёкие» куски текста (весь контейнер характеристик,
+// соседний блок) остаются ограниченными, иначе в анализ попадёт мусор.
+const ASG_MAX_VALUE = 4000;
 const ASG_MAX_DESCRIPTION = 4000;
 
 // Контейнеры с характеристиками: внутри них ищем подпись «Состав»
@@ -79,10 +84,20 @@ const ASG_EMPTY_COMPOSITION =
 // Такие кандидаты отбрасываем, только если за фразой нет перечня ингредиентов.
 const ASG_COMPOSITION_CLAIM = /^(не содержит|не содержит\s|не имеет|не включает|без\s)/i;
 
-// Рекламные блоки, которые иногда стоят сразу после метки «Состав»:
-// «Преимущества: батончики без сахара; десерт без сахара; …»
-const ASG_NOT_COMPOSITION_START =
-  /^(преимущества|достоинства|плюсы|минусы|почему|зачем|сравнение|подборка|в наличии|подходит для)/i;
+// Начала текстов, которые не могут быть составом.
+// Рекламные блоки: «Преимущества: батончики без сахара; десерт без сахара; …».
+// Строки характеристик: «Цель: Восстановление, Выносливость, …» — шесть пунктов
+// через запятую выглядят как перечень ингредиентов, поэтому их тоже отсекаем.
+// Граница слова задаётся через (?![\p{L}]) с флагом u: в JavaScript кириллица
+// не относится к word characters, поэтому \b не срабатывает после русского
+// слова. Флаг u обязателен — без него \p{L} трактуется как набор букв p, L, {.
+const ASG_NOT_COMPOSITION_START = new RegExp(
+  '^(?:преимущества|достоинства|плюсы|минусы|почему|зачем|сравнение|подборка|' +
+    'подходит для|в наличии|цель|назначение|применение|способ применения|тип|форма|' +
+    'длина|объ[её]м|объем|аромат|вкус|упаковка|комплектация|материал|вид|свойства)' +
+    '(?![\\p{L}])',
+  'iu'
+);
 
 // Есть ли за текстом перечень ингредиентов. Перечнем считаются пункты, где
 // названы компоненты, а не перечисление отсутствий:
@@ -108,16 +123,17 @@ function asgOnlyAbsences(parts) {
 // Оценка «похоже ли значение на состав». Метка «Состав» — главный сигнал,
 // поэтому проверяем, что это не цена/доставка/отзывы и что это перечисление.
 // Возвращаем число частей (больше — надёжнее) или -1, если это не состав.
-function asgCompositionScore(text) {
+function asgCompositionScore(text, maxLen) {
   const t = asgCollapse(text);
-  if (t.length < 8 || t.length > ASG_MAX_COMPOSITION) return -1;
+  const cap = maxLen || ASG_MAX_COMPOSITION;
+  if (t.length < 8 || t.length > cap) return -1;
   if (ASG_NOT_COMPOSITION.test(t)) return -1;
   if (ASG_EMPTY_COMPOSITION.test(t)) return -1;
   if (ASG_NOT_COMPOSITION_START.test(t)) return -1;
   // «не содержит сахара…» — рекламное начало настоящего состава
   if (ASG_COMPOSITION_CLAIM.test(t) && !asgLooksLikeList(t)) return -1;
   if (
-    /^(вес товара|страна|габарит|цвет\b|срок годности|бренд|производител|пищевая ценность|калорийност|условия хранения|сертификат|страна изготовления)/i.test(
+    /^(вес товара|страна|габарит|цвет(?![\p{L}])|срок годности|бренд|производител|пищевая ценность|калорийност|условия хранения|сертификат|страна изготовления)/iu.test(
       t
     )
   ) {
@@ -168,9 +184,12 @@ function asgLabeledValues(el, labelText, maxLen) {
   const out = [];
   const t = asgCollapse(el.textContent);
 
+  // значение, стоящее рядом с подписью, длинным быть может; куски подальше —
+  // нет, иначе в анализ попадёт весь контейнер характеристик
   const add = (v, tier) => {
+    const lim = tier <= ASG_TIER_SIBLING ? Math.max(max, ASG_MAX_VALUE) : max;
     const text = asgCollapse(v);
-    if (text.length >= 5 && text.length <= max) out.push({ text, tier });
+    if (text.length >= 5 && text.length <= lim) out.push({ text, tier });
   };
 
   const colon = t.indexOf(':');
@@ -214,7 +233,7 @@ function asgLabeledCandidates(doc, labelRe, maxLen) {
       const colon = head.indexOf(':');
       if (colon !== -1) {
         const tail = asgCollapse(head.slice(colon + 1));
-        if (tail.length >= 5 && tail.length <= max) {
+        if (tail.length >= 5 && tail.length <= ASG_MAX_VALUE) {
           found.push({ text: tail, tier: ASG_TIER_SAME });
         }
       }
@@ -223,7 +242,7 @@ function asgLabeledCandidates(doc, labelRe, maxLen) {
       const idx = inRow.indexOf(c);
       for (let i = idx + 1; i < inRow.length; i++) {
         const v = asgCollapse(inRow[i].textContent);
-        if (v.length >= 5 && v.length <= max) {
+        if (v.length >= 5 && v.length <= ASG_MAX_VALUE) {
           found.push({ text: v, tier: ASG_TIER_SIBLING });
         }
       }
@@ -429,7 +448,10 @@ function asgFindComposition(doc, selectors) {
   const cands = [];
   const add = (text, tier) => {
     const t = asgCollapse(text);
-    const parts = asgCompositionScore(t);
+    // прямые значения (рядом с подписью) допускаем длинными — ассорти с
+    // несколькими вкусами иначе отбрасывается целиком
+    const cap = tier <= ASG_TIER_SIBLING ? ASG_MAX_VALUE : ASG_MAX_COMPOSITION;
+    const parts = asgCompositionScore(t, cap);
     if (parts > 0) cands.push({ text: t, tier, parts });
   };
 
@@ -480,9 +502,12 @@ function asgFindComposition(doc, selectors) {
   if (fromJson) add(fromJson, ASG_TIER_JSON);
 
   // 6) текстовый скан всей страницы
+  // Только с двоеточием: «Состав: …». Без двоеточия слово «состав» почти всегда
+  // встречается в обычном тексте («по составу есть три источника белка…»), и
+  // такой обрывок маркетинга раньше становился «составом».
   try {
     const text = asgVisibleText(doc, 80000);
-    const m = /состав\s*:?\s*([\s\S]{8,800})/i.exec(text);
+    const m = /состав\s*:\s*([\s\S]{8,1500})/i.exec(text);
     if (m) {
       let v = asgCollapse(m[1]);
       const b = ASG_SECTION_BOUNDARY.exec(v);
