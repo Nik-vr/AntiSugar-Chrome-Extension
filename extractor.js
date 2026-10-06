@@ -24,6 +24,10 @@ const ASG_NAV_NOISE =
 const ASG_COMPOSITION_LABEL =
   /^\s*(состав|состав\s+товара|состав\s+продукта|ингредиенты|ингредиент[ы]?(\s+и\s+состав)?|ingredients|composition)\s*[:—-]?\s*$/i;
 const ASG_DESCRIPTION_LABEL = /^\s*(описани[ея]|описание\s+товара|description)\s*[:—-]?\s*$/i;
+// Начало подписи «Состав» вместе со значением в том же элементе:
+// «Состав: концентрат сывороточного белка, …». Хвост не ограничен по длине.
+const ASG_COMPOSITION_PREFIX =
+  /^\s*(?:состав|ингредиенты|ингредиент[ы]?|ingredients|composition)\s*[:—-]\s*/i;
 
 const ASG_MAX_COMPOSITION = 1500;
 // Состав может быть длинным — ассорти с четырьмя вкусами легко переваливает за
@@ -52,7 +56,12 @@ const ASG_TIER_JSON = 8; // состояние страницы
 const ASG_TIER_TEXT = 9; // текстовый скан всей страницы
 
 function asgCollapse(t) {
-  return String(t || '').replace(/\s+/g, ' ').trim();
+  return String(t || '')
+    // Ozon местами лепит невидимые символы: с zero-width после «Состав:»
+    // строгая проверка подписи не проходит и настоящий состав теряется
+    .replace(/[\u00AD\u200B-\u200D\u2060\uFEFF]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 
 // Видимый текст документа без скриптов и стилей (обход дерева, без клонирования DOM)
@@ -120,14 +129,24 @@ function asgOnlyAbsences(parts) {
   return parts.every((p) => /^(без|не содержит|не имеет|не включает)/i.test(p));
 }
 
+// Начала блоков, которые не состав ни при каком расположении: отзывы,
+// рекомендации, реклама. Отличаются от ASG_NOT_COMPOSITION тем, что смотрят
+// только на начало текста, поэтому остаются в силе и в мягком режиме.
+const ASG_NOT_COMPOSITION_HEAD =
+  /^(отзыв|рейтинг|рекоменд|доставк|куп|скидк|бонус|акци|распродаж|подборк|сравнени)/iu;
+
 // Оценка «похоже ли значение на состав». Метка «Состав» — главный сигнал,
 // поэтому проверяем, что это не цена/доставка/отзывы и что это перечисление.
 // Возвращаем число частей (больше — надёжнее) или -1, если это не состав.
-function asgCompositionScore(text, maxLen) {
+// lenient — значение стоит прямо рядом с найденной подписью «Состав»: тогда
+// даже упоминание «отзыв» или «рекомендов» внутри текста не приговор (такие
+// пометки пишут в самом составе), а вот структурные проверки остаются.
+function asgCompositionScore(text, maxLen, lenient) {
   const t = asgCollapse(text);
   const cap = maxLen || ASG_MAX_COMPOSITION;
   if (t.length < 8 || t.length > cap) return -1;
-  if (ASG_NOT_COMPOSITION.test(t)) return -1;
+  if (!lenient && ASG_NOT_COMPOSITION.test(t)) return -1;
+  if (ASG_NOT_COMPOSITION_HEAD.test(t)) return -1;
   if (ASG_EMPTY_COMPOSITION.test(t)) return -1;
   if (ASG_NOT_COMPOSITION_START.test(t)) return -1;
   // «не содержит сахара…» — рекламное начало настоящего состава
@@ -150,6 +169,24 @@ function asgCompositionScore(text, maxLen) {
     return -1;
   }
   return parts.length;
+}
+
+// Почему текст не признан составом: имя правила или пустая строка.
+// Нужно для отчёта «Диагностика», чтобы не гадать, какая проверка сработала.
+function asgCompositionReject(text, maxLen) {
+  const t = asgCollapse(text);
+  const cap = maxLen || ASG_MAX_COMPOSITION;
+  if (t.length < 8) return 'слишком короткий';
+  if (t.length > cap) return 'длиннее ' + cap + ' символов';
+  if (ASG_NOT_COMPOSITION.test(t)) {
+    const m = /(отзыв|рейтинг|доставк|гарант|₽|руб|скидк|акци|бонус|пункт выдачи|купить|в корзин|посмотреть|сравнить|ваша корзин|рассрочк|баллы|рекомендов)/i.exec(t);
+    return 'похоже на рекламу или отзывы: «' + (m ? m[0] : '?') + '»';
+  }
+  if (ASG_EMPTY_COMPOSITION.test(t)) return 'заглушка «нет данных / по запросу»';
+  if (ASG_NOT_COMPOSITION_START.test(t)) return 'строка характеристики или рекламы';
+  if (ASG_COMPOSITION_CLAIM.test(t) && !asgLooksLikeList(t)) return 'рекламное начало без перечня';
+  const s = asgCompositionScore(t, cap);
+  return s > 0 ? '' : 'не похоже на перечень';
 }
 
 // Похож ли состав на завершённый: скобки сбалансированы, нет обрыва на
@@ -202,6 +239,12 @@ function asgLabeledValues(el, labelText, maxLen) {
 
   if (el.nextElementSibling) {
     add(el.nextElementSibling.textContent, ASG_TIER_SIBLING);
+  }
+
+  // в <dl> значение иногда не соседний узел, а следующий <dd> того же родителя
+  if (el.tagName === 'DT' && el.parentElement) {
+    const dd = el.parentElement.querySelector('dd');
+    if (dd && dd !== el.nextElementSibling) add(dd.textContent, ASG_TIER_SIBLING);
   }
 
   if (el.parentElement) {
@@ -263,6 +306,15 @@ function asgLabeledCandidates(doc, labelRe, maxLen) {
     );
     for (const el of els) {
       const t = asgCollapse(el.textContent);
+      if (!t) continue;
+      // «Состав: <значение>» в одном элементе. Раньше такой элемент отбрасывался
+      // по длине (значение состава всегда длиннее 120 символов) и строгой
+      // проверке подписи, которой длинный хвост не соответствует.
+      const pref = ASG_COMPOSITION_PREFIX.exec(t);
+      if (pref) {
+        found.push({ text: asgCollapse(t.slice(pref[0].length)), tier: ASG_TIER_SAME });
+        continue;
+      }
       if (t.length > 120 || !labelRe.test(t)) continue;
       for (const cand of asgLabeledValues(el, t, max)) found.push(cand);
     }
@@ -449,9 +501,11 @@ function asgFindComposition(doc, selectors) {
   const add = (text, tier) => {
     const t = asgCollapse(text);
     // прямые значения (рядом с подписью) допускаем длинными — ассорти с
-    // несколькими вкусами иначе отбрасывается целиком
-    const cap = tier <= ASG_TIER_SIBLING ? ASG_MAX_VALUE : ASG_MAX_COMPOSITION;
-    const parts = asgCompositionScore(t, cap);
+    // несколькими вкусами иначе отбрасывается целиком; и оцениваем их мягче:
+    // подпись «Состав» найдена, значит это её значение
+    const direct = tier <= ASG_TIER_SIBLING;
+    const cap = direct ? ASG_MAX_VALUE : ASG_MAX_COMPOSITION;
+    const parts = asgCompositionScore(t, cap, direct);
     if (parts > 0) cands.push({ text: t, tier, parts });
   };
 
@@ -533,7 +587,14 @@ function asgFindComposition(doc, selectors) {
   return {
     text: best.text,
     tier: best.tier,
-    candidates: cands.length
+    candidates: cands.length,
+    // список кандидатов для диагностики: что вообще рассматривалось и почему
+    // выбран именно этот — снимает гадание по отчёту
+    list: cands.slice(0, 8).map((c) => ({
+      tier: c.tier,
+      len: c.text.length,
+      head: c.text.slice(0, 70)
+    }))
   };
 }
 
@@ -629,7 +690,12 @@ function asgProbeComposition(doc) {
         dataTest: el.getAttribute('data-test') || '',
         dataWidget: el.getAttribute('data-widget') || '',
         text: t.slice(0, 80),
-        nextText: next ? asgCollapse(next.textContent).slice(0, 80) : '',
+        nextText: next ? asgCollapse(next.textContent).slice(0, 300) : '',
+        // проходит ли соседний текст проверку состава и почему нет — чтобы по
+        // отчёту было видно, кандидат отброшен или его просто не нашли
+        nextScore: next ? asgCompositionScore(next.textContent, ASG_MAX_VALUE) : null,
+        nextLen: next ? asgCollapse(next.textContent).length : 0,
+        nextReject: next ? asgCompositionReject(next.textContent, ASG_MAX_VALUE) : null,
         parentTextLen: el.parentElement
           ? asgCollapse(el.parentElement.textContent).length
           : 0
@@ -678,10 +744,12 @@ function asgExtractFromDoc(doc, settings) {
       out.composition = comp.text;
       out.compositionTier = comp.tier;
       out.compositionCandidates = comp.candidates;
+      out.compositionCandidatesList = comp.list || [];
     } else {
       out.composition = null;
       out.compositionTier = 0;
       out.compositionCandidates = 0;
+      out.compositionCandidatesList = [];
     }
   } catch (e) { /* ignore */ }
   try {

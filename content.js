@@ -451,7 +451,7 @@ function isConfirmed(r) {
       // по описанию — а там маркетинговый текст, и он даёт ложные находки.
       // Поэтому ждём состав ещё COMPOSE_WAIT_MS и пересчитываем, как только он
       // появится. Проверка идёт раз в COMPOSE_PROBE_MS и только на тихой странице.
-      if (composeWaitUntil > now && !(lastExtract && lastExtract.hasComposition)) {
+      if (composeWaitUntil > now && asgWeakComposition(lastExtract)) {
         const len = bodyTextLen();
         if (len > lastBodyLen) {
           lastGrowthAt = now;
@@ -460,8 +460,8 @@ function isConfirmed(r) {
         if (now - composeProbeAt >= COMPOSE_PROBE_MS && isSettled()) {
           composeProbeAt = now;
           const fresh = asgExtractFromDoc(document, settings);
-          if (fresh.hasComposition) {
-            rememberNote('блок «Состав» появился после окна наблюдения — пересчёт по нему');
+          if (!asgWeakComposition(fresh)) {
+            rememberNote('найден настоящий блок «Состав» — пересчёт по нему');
             analyze(true, true);
             stopWatch();
             return;
@@ -512,10 +512,15 @@ if (!lastFinal && isSettled()) {
 
   // --- диагностика ---
 
-  // Почему на этой странице расширение не работает. null — работает.
-  // Нужно, чтобы в отчёте не выглядело как «состав не найден», когда мы
-  // просто не анализируем страницу: например на github.com из нашего README
-  // проба находит слово «состав» в тексте про само расширение.
+// Слабый источник состава: скан текста всей страницы или догадка «блок после
+// родителя подписи». Такой «состав» часто оказывается маркетинговым текстом,
+// поэтому настоящий блок «Состав» стоит дождаться, даже если что-то нашлось.
+function asgWeakComposition(e) {
+  if (!e || !e.hasComposition) return true;
+  return e.compositionTier === ASG_TIER_PARENT_SIBLING || e.compositionTier === ASG_TIER_TEXT;
+}
+
+// Почему на этой странице расширение не работает. null — работает.
   function inactiveReason() {
     if (!settings || !settings.enabled) return 'расширение выключено в настройках';
     if (!hostAllowed()) return 'сайт ' + location.hostname + ' не в списке разрешённых';
@@ -559,6 +564,7 @@ if (!lastFinal && isSettled()) {
         authoritative: !!e.authoritative,
         compositionTier: e.compositionTier || 0,
         compositionCandidates: e.compositionCandidates || 0,
+        compositionCandidatesList: e.compositionCandidatesList || [],
         compositionParts: e.compositionParts || 0,
         compositionWellFormed: !!e.compositionWellFormed,
         ingredientListLike: !!e.ingredientListLike,

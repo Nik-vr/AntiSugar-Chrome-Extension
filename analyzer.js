@@ -4,6 +4,9 @@ const ASG_ZONES = ['red', 'orange', 'yellow', 'green'];
 
 function asgNorm(t) {
   return String(t || '')
+    // невидимые символы внутри слов ломают и сопоставление ключевых слов,
+    // и границу слова: убираем на входе
+    .replace(/[\u00AD\u200B-\u200D\u2060\uFEFF]/g, '')
     .replace(/\s+/g, ' ')
     .trim()
     .toLowerCase();
