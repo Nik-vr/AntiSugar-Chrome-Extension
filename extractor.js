@@ -84,9 +84,22 @@ function asgVisibleText(doc, limit) {
   return out.replace(/\s+/g, ' ').trim().slice(0, max);
 }
 
-// Признаки того, что блок «Состав» существует формально, но не содержит состава
+// Признаки того, что блок «Состав» существует формально, но не содержит состава.
+// «Состав:» — заглушка только когда после подписи ничего нет: значение вида
+// «Состав: сорбитол, аспартам, лимонная кислота» — это настоящий состав,
+// и раньше проба называла его заглушкой.
 const ASG_EMPTY_COMPOSITION =
-  /^(не указан|нет данных|нет\s|по запросу|см\.?\s|уточняйте|на упаковке|упаковке|изготовител|состав не|данные отсутствуют|информация|состав:|—|-|\.)/i;
+  /^(не указан|нет данных|нет\s|по запросу|см\.?\s|уточняйте|на упаковке|упаковке|изготовител|состав не|данные отсутствуют|информация|состав:\s*$|—|-|\.)/i;
+
+// Подпись «Состав» может быть приклеена к значению («Состав: уточняйте по
+// запросу»), поэтому заглушку ищем и по тексту без подписи.
+const ASG_LABEL_PREFIX = /^\s*состав\s*:\s*/i;
+
+function asgIsEmptyComposition(t) {
+  if (ASG_EMPTY_COMPOSITION.test(t)) return true;
+  const stripped = t.replace(ASG_LABEL_PREFIX, '');
+  return stripped !== t && ASG_EMPTY_COMPOSITION.test(stripped);
+}
 
 // Начало с рекламной фразы «не содержит сахара и пальмового масла. Батончик…» —
 // это не заглушка, а настоящий состав, у которого первая фраза рекламная.
@@ -141,13 +154,13 @@ const ASG_NOT_COMPOSITION_HEAD =
 // lenient — значение стоит прямо рядом с найденной подписью «Состав»: тогда
 // даже упоминание «отзыв» или «рекомендов» внутри текста не приговор (такие
 // пометки пишут в самом составе), а вот структурные проверки остаются.
-function asgCompositionScore(text, maxLen, lenient) {
+function asgCompositionScore(text, maxLen, lenient, allowSingle) {
   const t = asgCollapse(text);
   const cap = maxLen || ASG_MAX_COMPOSITION;
   if (t.length < 8 || t.length > cap) return -1;
   if (!lenient && ASG_NOT_COMPOSITION.test(t)) return -1;
   if (ASG_NOT_COMPOSITION_HEAD.test(t)) return -1;
-  if (ASG_EMPTY_COMPOSITION.test(t)) return -1;
+  if (asgIsEmptyComposition(t)) return -1;
   if (ASG_NOT_COMPOSITION_START.test(t)) return -1;
   // «не содержит сахара…» — рекламное начало настоящего состава
   if (ASG_COMPOSITION_CLAIM.test(t) && !asgLooksLikeList(t)) return -1;
@@ -159,6 +172,10 @@ function asgCompositionScore(text, maxLen, lenient) {
     return -1;
   }
   const parts = t.split(/[,;]/).map((s) => s.trim()).filter(Boolean);
+  // Перечень — два и более пункта либо компонент с количеством. Одиночный
+  // компонент («пюре яблочное») составом тоже является, но только когда стоит
+  // рядом с подписью: издалека одна фраза — это не перечень.
+  if (!asgIngredientListLike(t) && !allowSingle) return -1;
   // «нет данных», «по запросу» и подобное — не состав
   if (
     parts.length <= 1 &&
@@ -182,9 +199,10 @@ function asgCompositionReject(text, maxLen) {
     const m = /(отзыв|рейтинг|доставк|гарант|₽|руб|скидк|акци|бонус|пункт выдачи|купить|в корзин|посмотреть|сравнить|ваша корзин|рассрочк|баллы|рекомендов)/i.exec(t);
     return 'похоже на рекламу или отзывы: «' + (m ? m[0] : '?') + '»';
   }
-  if (ASG_EMPTY_COMPOSITION.test(t)) return 'заглушка «нет данных / по запросу»';
+  if (asgIsEmptyComposition(t)) return 'заглушка «нет данных / по запросу»';
   if (ASG_NOT_COMPOSITION_START.test(t)) return 'строка характеристики или рекламы';
   if (ASG_COMPOSITION_CLAIM.test(t) && !asgLooksLikeList(t)) return 'рекламное начало без перечня';
+  if (!asgIngredientListLike(t)) return 'нет перечня: одна часть без количества';
   const s = asgCompositionScore(t, cap);
   return s > 0 ? '' : 'не похоже на перечень';
 }
@@ -194,18 +212,35 @@ function asgCompositionReject(text, maxLen) {
 // считать достоверным: в нём обрезаны и слова, и их окончания.
 function asgCompositionWellFormed(text) {
   const t = asgCollapse(text);
-  if (t.length < 15) return false;
+  // короткий состав из одного компонента («пюре яблочное») — завершённый
+  if (t.length < 8) return false;
   const open = (t.match(/[(«\[]/g) || []).length;
   const close = (t.match(/[)\]»]/g) || []).length;
   if (open !== close) return false;
   if (/[,;:]$/.test(t)) return false;
-  if (/\b(и|или|а|но|из|с|по|для|без|при|от)\s*$/i.test(t)) return false;
+  // \b в JS не работает с кириллицей, поэтому границу задаём пробелом
+  if (/(?:\s|^)(и|или|а|но|из|с|по|для|без|при|от)\s*$/i.test(t)) return false;
   return true;
 }
 
 // Похож ли текст на перечень ингредиентов, а не на обычную фразу.
 // Настоящий состав — это список (2+ части через запятую/точку с запятой)
 // либо компонент с количеством («кофе в зёрнах 100%»).
+// Источники, которым можно верить: значение найдено по подписи «Состав» —
+// рядом с ней, в её контейнере, в атрибутах или в состоянии страницы.
+// Нельзя: весь текст родителя, блок после него и скан текста страницы, где
+// попадает и реклама, и описание товара.
+function asgTrustedComposition(tier) {
+  return (
+    tier === ASG_TIER_SELECTOR ||
+    tier === ASG_TIER_SAME ||
+    tier === ASG_TIER_SIBLING ||
+    tier === ASG_TIER_ATTRIBUTE ||
+    tier === ASG_TIER_CONTAINER ||
+    tier === ASG_TIER_JSON
+  );
+}
+
 function asgIngredientListLike(text) {
   const t = asgCollapse(text);
   if (!t) return false;
@@ -488,7 +523,9 @@ function asgCompositionFromSources(doc) {
         raw = raw.replace(/["']/g, ' ').replace(/,/g, ', ');
       }
       const v = asgCollapse(raw.replace(/[{}[\]]/g, ' '));
-      if (asgCompositionScore(v) > 0) return v;
+      // значение найдено прямо рядом с подписью в данных страницы, поэтому
+      // одиночный компонент («пюре яблочное») здесь допустим
+      if (asgCompositionScore(v, ASG_MAX_COMPOSITION, true, true) > 0) return v;
     }
   }
   return null;
@@ -496,17 +533,77 @@ function asgCompositionFromSources(doc) {
 
 // Блок «Состав». Кандидаты ранжируются по надёжности источника, а не по числу
 // запятых: иначе рекламный текст с обилием запятых побеждает настоящий состав.
+// Ozon дописывает к составу блок пищевой ценности: «Содержание (расчётное)
+// в 100 г: …, общего сахара (в пересчёте на сахарозу) 2,0 г». Это не состав:
+// у сахарной халвы там суммарные сахара из подсластителя-изомальта. Обрезаем
+// такой хвост. Слово «содержание» само по себе не обрезается — «содержание
+// какао 8%» — обычный компонент.
+const asgNutritionTail =
+  /(содержание\s*[\(（]|содержание\s+на\s*100|пищевая\s+ценность|питание\s+на|энергетическая\s+ценность|углеводы\b\s*:)/i;
+
+// Названия товара: одиночный «состав», совпадающий с названием, — это не
+// состав. Сравниваем без знаков и регистра: «Гранола - Кранч шоколадные с
+// клубникой и бананом Bionova» и заголовок страницы отличаются лишь хвостом.
+function asgProductTitles(doc) {
+  const out = [];
+  const add = (t) => {
+    const v = asgCollapse(t)
+      .toLowerCase()
+      .replace(/[^\p{L}\p{N} ]+/gu, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    if (v.length >= 12) out.push(v);
+  };
+  try {
+    const h1 = doc.querySelector('h1');
+    if (h1) add(h1.textContent);
+    add((doc.documentElement && doc.documentElement.title) || '');
+  } catch (e) { /* ignore */ }
+  return out;
+}
+
+function asgLooksLikeTitle(titles, text) {
+  const raw = asgCollapse(text);
+  const v = raw
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N} ]+/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (v.length < 12) return false;
+  if (!titles.some((t) => t.indexOf(v) !== -1 || v.indexOf(t) !== -1)) return false;
+  // Отбрасываем именно название, а не любой текст, совпавший с заголовком.
+  // У названия — много слов и либо тире-разбивка («Гранола - Кранч
+  // шоколадные с клубникой и бананом Bionova»), либо несколько слов с
+  // заглавной. Короткий состав, который по закону совпадает с заголовком
+  // («гречневая мука», «пюре яблочное»), остаётся составом.
+  const words = v.split(' ').length;
+  if (words < 4) return false;
+  const caps = (raw.match(/(?:^|\s)[A-ZА-ЯЁ][^\s]*/g) || []).length;
+  return /\s[-–—]\s/.test(raw) || caps >= 2;
+}
+
 function asgFindComposition(doc, selectors) {
   const cands = [];
+  const titles = asgProductTitles(doc);
+  // одиночный компонент отличаем от названия товара по заголовку страницы;
+  // если заголовка нет, отличить нечем — и одиночную фразу не берём
+  const mayBeSingle = titles.length > 0;
   const add = (text, tier) => {
-    const t = asgCollapse(text);
+    let t = asgCollapse(text);
     // прямые значения (рядом с подписью) допускаем длинными — ассорти с
     // несколькими вкусами иначе отбрасывается целиком; и оцениваем их мягче:
     // подпись «Состав» найдена, значит это её значение
     const direct = tier <= ASG_TIER_SIBLING;
     const cap = direct ? ASG_MAX_VALUE : ASG_MAX_COMPOSITION;
-    const parts = asgCompositionScore(t, cap, direct);
-    if (parts > 0) cands.push({ text: t, tier, parts });
+    // хвост «Содержание (расчётное) в 100 г: …» — это пищевая ценность,
+    // а не состав: у сахарной халвы там «общего сахара 2 г», и это не сахар
+    const nut = asgNutritionTail.exec(t);
+    if (nut && nut.index > 20) t = asgCollapse(t.slice(0, nut.index));
+    const listLike = asgIngredientListLike(t);
+    // одиночная фраза вместо состава, если она совпадает с названием товара
+    if (!listLike && asgLooksLikeTitle(titles, t)) return;
+    const parts = asgCompositionScore(t, cap, direct, direct && mayBeSingle);
+    if (parts > 0) cands.push({ text: t, tier, parts, listLike: listLike });
   };
 
   // 1) селекторы из настроек
@@ -571,9 +668,12 @@ function asgFindComposition(doc, selectors) {
   } catch (e) { /* ignore */ }
 
   if (!cands.length) return null;
-  // 1) завершённость (обрезанный состав не берём, если есть целый);
-  // 2) надёжность источника; 3) компактность; 4) число компонентов
+  // 1) перечень лучше одиночного компонента: у гранулы рядом с подписью стояло
+  //    название товара, а настоящий состав нашёлся дальше по тексту;
+  // 2) завершённость (обрезанный состав не берём, если есть целый);
+  // 3) надёжность источника; 4) компактность; 5) число компонентов
   cands.sort((a, b) => {
+    if (a.listLike !== b.listLike) return a.listLike ? -1 : 1;
     const wa = asgCompositionWellFormed(a.text) ? 0 : 1;
     const wb = asgCompositionWellFormed(b.text) ? 0 : 1;
     if (wa !== wb) return wa - wb;
@@ -673,6 +773,8 @@ function asgProbeComposition(doc) {
   if (!out.wordInHtml) return out;
 
   try {
+    // одиночный компонент отличаем от названия по заголовку страницы
+    const mayBeSingle = asgProductTitles(doc).length > 0;
     const els = doc.querySelectorAll(
       'div, span, p, b, strong, dt, dd, td, th, li, label, h1, h2, h3, h4, h5, h6, summary'
     );
@@ -693,7 +795,9 @@ function asgProbeComposition(doc) {
         nextText: next ? asgCollapse(next.textContent).slice(0, 300) : '',
         // проходит ли соседний текст проверку состава и почему нет — чтобы по
         // отчёту было видно, кандидат отброшен или его просто не нашли
-        nextScore: next ? asgCompositionScore(next.textContent, ASG_MAX_VALUE) : null,
+        nextScore: next
+          ? asgCompositionScore(next.textContent, ASG_MAX_VALUE, true, mayBeSingle)
+          : null,
         nextLen: next ? asgCollapse(next.textContent).length : 0,
         nextReject: next ? asgCompositionReject(next.textContent, ASG_MAX_VALUE) : null,
         parentTextLen: el.parentElement
@@ -766,11 +870,21 @@ function asgExtractFromDoc(doc, settings) {
     : 0;
   out.compositionWellFormed = asgCompositionWellFormed(out.composition || '');
   out.ingredientListLike = asgIngredientListLike(out.composition || '');
+  // Состав из одного компонента («пюре яблочное») тоже достоверен, если стоит
+  // рядом с подписью «Состав» и не повторяет название товара.
+  out.singleComponent =
+    out.hasComposition && !out.ingredientListLike && out.compositionParts === 1;
+  out.compositionIsTitle =
+    out.singleComponent && asgLooksLikeTitle(asgProductTitles(doc), out.composition || '');
   // Зелёный флаг доказуем только завершённым блоком «Состав», который при этом
   // выглядит как перечень ингредиентов. Описание — маркетинговый текст,
   // обрезанный состав может содержать обрыв слова, а обычная фраза с
-  // подписью «Состав» — вовсе не перечень.
+  // подписью «Состав» — вовсе не перечень. Текст, собранный сканом страницы,
+  // доказательством тоже не является: там легко попасть в описание.
   out.authoritative =
-    out.hasComposition && out.compositionWellFormed && out.ingredientListLike;
+    out.hasComposition &&
+    asgTrustedComposition(out.compositionTier) &&
+    out.compositionWellFormed &&
+    (out.ingredientListLike || (out.singleComponent && !out.compositionIsTitle));
   return out;
 }

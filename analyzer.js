@@ -80,8 +80,13 @@ const ASG_POST_NEGATIONS = ['нет', 'нету', 'не', 'отсутствуе�
 
 function asgNegatedAfterWords(t, end) {
   let tail = t.slice(end, end + 48);
+  // Закрывающая скобка сразу после совпадения — артефакт разметки
+  // («мёд) не содержит»), отрицание относится к тому же компоненту
+  tail = tail.slice(/^\s*[)\]»]*/.exec(tail)[0].length);
+  // А вот запятая — это уже следующий компонент: в «финики, сахар не
+  // используется» «не» относится к сахару, а не к финикам
   const cut = tail.search(/[,;:.!?()«"]/);
-  if (cut > 0) tail = tail.slice(0, cut);
+  if (cut >= 0) tail = tail.slice(0, cut);
   const words = (tail.match(ASG_WORD_RE) || []).slice(0, 4);
   if (!words.length) return false;
   // текст транслитерирован, значит и список отрицаний должен быть в той же форме
@@ -125,6 +130,15 @@ function asgEndingOk(t, end) {
   return j - end <= ASG_MAX_ENDING;
 }
 
+// Конец полного слова, начавшегося в pos. Совпадение ищем по основе
+// («сорбит» ⊂ «сорбитол»), но в отчёте показываем слово целиком: по
+// «Сорбит (E420) [сорбит]» не видно, что в составе написано «сорбитол».
+function asgWordEndAt(t, pos) {
+  let j = pos;
+  while (j < t.length && ASG_WORD_CHAR.test(t[j])) j++;
+  return j;
+}
+
 // Первое вхождение основы с начала слова и без нового корня
 function asgFindInWindow(t, needle, from, to) {
   let idx = from;
@@ -156,7 +170,7 @@ function asgSpansForStems(t, stems) {
       const from = Math.max(0, idx - ASG_NEAR);
       const to = Math.min(t.length, anchorEnd + ASG_NEAR);
       let start = idx;
-      let end = anchorEnd;
+      let end = asgWordEndAt(t, anchorEnd);
       let ok = true;
       for (const w of rest) {
         const at = asgFindInWindow(t, w, from, to);
@@ -165,11 +179,11 @@ function asgSpansForStems(t, stems) {
           break;
         }
         start = Math.min(start, at);
-        end = Math.max(end, at + w.length);
+        end = Math.max(end, asgWordEndAt(t, at + w.length));
       }
       // между словами ключа не должно быть запятой — иначе это разные компоненты
       if (ok && /[,;]/.test(t.slice(start, end))) ok = false;
-      if (ok) out.push({ start, end });
+      if (ok) out.push({ start, end, word: t.slice(start, end) });
     }
     idx = anchorEnd;
   }
@@ -209,7 +223,8 @@ function asgContextBlocked(t, start, end, cx) {
 // Контекстные слова («ноты», «привкус») работают в широком окне: они указывают
 // на вкусовое описание. Слова-исключения — только вплотную к совпадению.
 function asgCollect(text, settings) {
-  const t = asgTranslit(asgNorm(text));
+  const src = asgNorm(text);
+  const t = asgTranslit(src);
   const zdef = (settings && settings.zones) || {};
   const ex = ((settings && settings.excludes) || []).map((e) => asgTranslit(asgNorm(e))).filter(Boolean);
   const cx = ((settings && settings.contextExcludes) || [])
@@ -232,7 +247,17 @@ function asgCollect(text, settings) {
           asgNegatedBefore(t, span.start, ex) ||
           asgNegatedAfter(t, span.end, ex) ||
           asgNegatedAfterWords(t, span.end);
-        if (!blocked) occ.push({ start: span.start, end: span.end, keyword: kwDisp, zone: z });
+        if (!blocked) {
+          occ.push({
+            start: span.start,
+            end: span.end,
+            keyword: kwDisp,
+            zone: z,
+            // само найденное слово из исходного текста (транслитерация в отчёте
+            // нечитаема), нужно для разбора ложных срабатываний
+            word: src.slice(span.start, span.end)
+          });
+        }
       }
     }
   }
@@ -269,6 +294,9 @@ function asgAnalyze(text, settings) {
       list.push({
         keyword: o.keyword,
         count: 1,
+        // что именно совпало в тексте — нужно для отчёта: по одному ключевому
+        // слову нельзя понять, мёд это или часть другого слова
+        word: o.word || o.keyword,
         name: (info && info.name) || o.keyword,
         risk: (info && info.risk) || ''
       });
@@ -305,6 +333,7 @@ function asgAnalyze(text, settings) {
         zone: z,
         keyword: m.keyword,
         count: m.count,
+        word: m.word || m.keyword,
         name: m.name,
         risk: m.risk
       });

@@ -165,7 +165,16 @@ document.addEventListener('DOMContentLoaded', async () => {
     els.rSource.textContent = SOURCE_LABEL[s.source] || s.source || '—';
     els.rCache.textContent = s.cached ? 'да' : 'нет';
     const words = (s.matches || [])
-      .map((m) => (m.name || m.keyword) + ' ×' + m.count)
+      .map((m) => {
+        const name = m.name || m.keyword;
+        // найденное слово из состава, если оно отличается от названия:
+        // «Сорбит (E420)» найден по слову «сорбитол»
+        const w =
+          m.word && name.toLowerCase().indexOf(String(m.word).toLowerCase()) === -1
+            ? ' (' + m.word + ')'
+            : '';
+        return name + ' ×' + m.count + w;
+      })
       .join(', ');
     if (words) {
       els.rowZones.style.display = '';

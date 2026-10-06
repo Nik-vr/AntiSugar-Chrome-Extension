@@ -8,6 +8,8 @@
   const BADGE_ATTR = 'asg-safety-badge';
   const PRODUCT_PATH_RE = /\/(product|catalog|card)\//i;
   const WATCH_MS = 20000; // окно наблюдения за до-рендером
+  const AWAIT_COMPOSITION_MS = 8000; // сколько ждём первый достоверный состав,
+  // прежде чем показать серый «состав не найден»
   const COMPOSE_WAIT_MS = 40000; // сколько ждём блок «Состав» после окна наблюдения
   const COMPOSE_PROBE_MS = 1000; // как часто проверять появление состава в этом ожидании
   const POLL_MS = 400; // как часто проверяем, изменился ли текст
@@ -43,6 +45,7 @@
   let lastAnalyzedAt = 0;
   let watchUntil = 0;
   let composeWaitUntil = 0;
+let awaitUntil = 0;
   let composeProbeAt = 0;
   let watching = false;
   let pollTimer = null;
@@ -176,6 +179,15 @@ function isConfirmed(r) {
     return { text, len: asgCollapse(full).length };
   }
 
+  // Нашлось ли хоть что-то: нужно, чтобы показывать находки даже без цвета
+function hasMatches(r) {
+    if (!r || !r.zones) return false;
+    for (const z of ZONE_ORDER) {
+      if ((r.zones[z] || []).length) return true;
+    }
+    return false;
+  }
+
   function renderBadge(res) {
     removeBadge();
     const r = res || { status: 'idle' };
@@ -194,14 +206,17 @@ function isConfirmed(r) {
     } else if (r.status === 'ok' && confirmed) {
       zone = ZONE_ORDER.indexOf(r.zone) !== -1 ? r.zone : 'green';
       if (zone === 'green' && settings && settings.markClean === false) return;
-      // Зелёный флаг — это утверждение «опасных веществ нет».
-      // Показывать его можно только при подтверждённом блоке «Состав».
-      // Проверка строгая: если флаг отсутствует (старая версия content script
-      // на открытой вкладке, запись из прежнего кэша) — зелёный не рисуем.
-      if (zone === 'green' && r.authoritative !== true) {
+      // Цвет ставится только по достоверному составу — найденному по подписи
+      // «Состав» и похожему на перечень. По описанию товара цвет не показываем:
+      // там встречаются «тростниковый сахар», «мёд» и прочие слова не из состава,
+      // и такой вердикт потом меняется, когда приходит настоящий состав.
+      // Проверка строгая: если флага нет (старая версия content script на
+      // открытой вкладке, запись из прежнего кэша) — цвет не рисуем.
+      if (r.authoritative !== true) {
         icon = '?';
         cls = 'b-gray';
-        label = 'Состав не найден';
+        label = r.source === 'состав' ? 'Состав не подтверждён' : 'Состав не найден';
+        zone = null;
       } else {
         icon = ZONE_ICON[zone];
         cls = 'b-' + zone;
@@ -257,24 +272,47 @@ function isConfirmed(r) {
       );
     }
 
-    if (zone) {
+    if (r.status === 'ok' && r.authoritative !== true && !r.skipped) {
+      lines.push(
+        '<div class="cnt">Цвет не показываем: эти слова найдены не в составе, а в ' +
+          'описании товара. Надёжная оценка — только по блоку «Состав».</div>'
+      );
+    }
+
+    if (r.status === 'ok' && (zone || hasMatches(r))) {
       for (const z of ZONE_ORDER) {
         const ms = (r.zones && r.zones[z]) || [];
         if (!ms.length) continue;
+        // Показываем все зоны, а не только старшую: сорбитол в «скрытых
+        // угрозах» не должен пропадать из-за аспартама в «высоком риске»
         lines.push('<div class="zh z-' + z + '">' + esc(ZONE_LABEL[z]) + '</div>');
         for (const m of ms) {
+          // найденное слово из состава, если оно отличается от названия
+          // компонента: «Сорбит (E420)» найден по слову «сорбитол»
+          const name = m.name || m.keyword;
+          const w =
+            m.word && name.toLowerCase().indexOf(String(m.word).toLowerCase()) === -1
+              ? ' · ' + esc(m.word)
+              : '';
           lines.push(
             '<div class="cmp"><b>' +
-              esc(m.name || m.keyword) +
+              esc(name) +
               '</b> ×' +
               m.count +
+              w +
               (m.risk ? '<br><span>' + esc(m.risk) + '</span>' : '') +
               '</div>'
           );
         }
       }
       if (r.snippet) lines.push('<div class="snip">' + esc(r.snippet) + '</div>');
-      if (zone === 'green' && r.authoritative !== true) {
+      if (!zone && hasMatches(r)) {
+        lines.push(
+          '<div class="snip">Оценка по описанию: эти компоненты упомянуты в тексте ' +
+            'товара, но не подтверждены блоком «Состав».</div>'
+        );
+      }
+      if (!zone && !hasMatches(r)) {
         lines.push(
           '<div class="snip">Блок «Состав» на странице не найден или не подтверждён. ' +
             'Опасные вещества в тексте страницы не обнаружены, но это не доказывает ' +
@@ -362,10 +400,32 @@ function isConfirmed(r) {
 
   // --- анализ ---
 
+  // На странице есть подпись «Состав», а значения пока нет: блок ещё подгружается.
+  // Если подписи на странице нет вовсе — ждать нечего.
+  function asgCompositionLabelPresent() {
+    if (!lastExtract || lastExtract.hasComposition) return false;
+    try {
+      return asgProbeComposition(document).labeled.length > 0;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  // Показывать вердикт рано опасно: пока блок «Состав» не подгрузился, товар
+  // оценивается по описанию, где встречаются «тростниковый сахар» и прочие
+  // слова не из состава — товар вспыхивает красным и потом меняет цвет. Поэтому
+  // первые AWAIT_COMPOSITION_MS показываем «проверяем состав…», если есть хоть
+  // какая-то chances найти настоящий состав.
+  function asgAwaitComposition(res) {
+    if (!res || res.status !== 'ok' || res.skipped) return false;
+    if (res.authoritative) return false;
+    if (awaitUntil <= Date.now()) return false;
+    return asgCompositionLabelPresent();
+  }
+
   async function analyze(force, final) {
     if (busy) return;
     busy = true;
-    if (final) lastFinal = true;
     try {
       const data = asgExtractFromDoc(document, settings);
       lastExtract = data;
@@ -403,6 +463,15 @@ function isConfirmed(r) {
         if (fb && fb.status === 'ok' && (fb.textLength || 0) > (res.textLength || 0)) {
           res = fb;
         }
+      }
+
+      if (asgAwaitComposition(res)) {
+        // результат по не-составу: показываем «проверяем состав…» и ждём
+        // настоящий блок, финальным считать такой расчёт нельзя
+        rememberNote('ждём блок «Состав»: пока считаем по ' + (res.source || 'странице'));
+        res = Object.assign({}, res, { complete: false, awaitingComposition: true });
+      } else if (final) {
+        lastFinal = true;
       }
 
       state = res || { status: 'error', error: 'Нет ответа' };
@@ -503,6 +572,7 @@ if (!lastFinal && isSettled()) {
     lastGrowthAt = Date.now();
     lastFinal = false;
     composeWaitUntil = Date.now() + WATCH_MS + COMPOSE_WAIT_MS;
+    awaitUntil = Date.now() + AWAIT_COMPOSITION_MS;
     composeProbeAt = 0;
     state = { status: 'pending' };
     updateBadge(true);
