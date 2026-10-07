@@ -1003,6 +1003,9 @@ function asgWeakComposition(e) {
     return {
       host: location.hostname,
       url: location.href,
+      // заголовок страницы: в сообщении о проблеме он показывает, о каком
+      // товаре речь, иначе письмо приходит с одним адресом
+      title: (document.title || '').slice(0, 120),
       version: ASG_VERSION,
       enabled: !!(settings && settings.enabled),
       hostAllowed: hostAllowed(),

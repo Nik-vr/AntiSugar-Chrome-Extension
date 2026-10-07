@@ -3,11 +3,19 @@
 // (ТОП-22, обновление 03.10.2026). Описания рисков — в components.js.
 
 // Версия расширения: показывается в попапе и в диагностике
-const ASG_VERSION = '1.5.7';
+const ASG_VERSION = '1.6.0';
 
 // Версия структуры настроек. Меняется при обновлении критериев — тогда кэш
 // сбрасывается, а сохранённые списки дополняются новыми значениями.
 const ASG_CFG_VERSION = 14;
+
+// Адрес скрипта приёма отчётов. Зашит в расширение, чтобы пользователю не надо
+// было ничего настраивать: кнопка «Отправить» работает сразу после установки.
+//
+// При переезде на другой домен меняется здесь, в одном месте. Адрес должен
+// совпадать с тем, где реально лежит server/report.php: если скрипт не на
+// месте, расширение сообщит «сервер недоступен» и предложит путь через буфер.
+const ASG_REPORT_ENDPOINT = 'https://lab.petrochenko.ru/antisahar/report.php';
 
 const ASG_DEFAULTS = {
   cfgVersion: ASG_CFG_VERSION,
@@ -206,7 +214,13 @@ const ASG_DEFAULTS = {
   // Как догружать страницу, если локального текста не хватило:
   // auto — сначала запрос, при блокировке — скрытая вкладка
   fetchStrategy: 'auto',
-  maxDescChars: 20000
+  maxDescChars: 20000,
+
+// Адрес сервера отчётов. По умолчанию зашит в расширение (ASG_REPORT_ENDPOINT):
+  // пользователю не нужно ничего настраивать. Пустая строка — если пользователь
+  // осознанно отключил отправку, тогда отчёт копируется в буфер, а письмо
+  // открывает он сам.
+  reportEndpoint: ASG_REPORT_ENDPOINT
 };
 
 // --- общие подписи зон -------------------------------------------------------
@@ -236,6 +250,170 @@ const ASG_SOURCE_LABEL = {
   'описание': 'блок «Описание»',
   'страница': 'текст страницы'
 };
+
+// --- сообщение разработчику о проблеме ---------------------------------------
+// Браузер не даёт расширению доступ к SMTP. Два пути:
+//
+//   1. Сервер разработчика. Адрес зашит в расширение: пользователь нажимает
+//      «Отправить» и всё. Ключа нет — расширение общедоступное, ключ из него
+//      можно вытащить, а требовать его от посторонних людей бессмысленно.
+//   2. Без сервера. Отчёт копируется в буфер, а письмо открывает сам человек.
+//
+// Второй путь остаётся рабочим всегда: сервер может быть недоступен, а
+// письмо с адресом товара всё равно можно отправить руками.
+const ASG_REPORT_EMAIL = 'antisahar@petrochenko.ru';
+const ASG_REPORT_MAX = 500; // длина комментария пользователя
+
+// Адрес для отправки: сохранённый пользователем, иначе зашитый в расширение.
+// Пустая строка означает «отправка отключена» — тогда работает путь через буфер.
+function asgReportEndpoint(cfg) {
+  const stored = String((cfg || {}).reportEndpoint || '').trim();
+  return stored || String(ASG_REPORT_ENDPOINT || '').trim();
+}
+
+// Проверка адреса сервера. Только https: по http отчёт с адресом товара и
+// диагностикой идёт открытым текстом мимо шифрования.
+function asgReportEndpointOk(url) {
+  const u = String(url || '').trim();
+  if (!u) return false;
+  if (!/^https:\/\/[^\s/?#]+/i.test(u)) return false;
+  // Запрещаем пробелы и переводы строк — иначе значение можно спрятать в
+  // соседнем поле при разборе запроса
+  return !/[\s"'<>`\\]/.test(u);
+}
+
+// Тело запроса на сервер.
+//
+// Ключ сюда не входит и пользователю его знать не нужно: расширение стоит в
+// общем доступе, ключ внутри него можно вытащить. Защиту обеспечивает сервер —
+// проверкой Origin и ограничением частоты.
+function asgReportPayload(diag, userMessage) {
+  const d = diag || {};
+  let host = '';
+  try {
+    host = new URL(String(d.url || '')).hostname;
+  } catch (e) {
+    host = String(d.host || '').slice(0, 190);
+  }
+  return {
+    message: String(userMessage || '').slice(0, ASG_REPORT_MAX),
+    url: String(d.url || '').trim().slice(0, 2000),
+    host: host,
+    version: String(d.version || ASG_VERSION).slice(0, 32),
+    report: asgBuildReport(d, userMessage).slice(0, 120000)
+  };
+}
+
+// Имя файла отчёта: видно в почтовом клиенте и в списке загрузок.
+function asgReportFileName(diag) {
+  const d = diag || {};
+  let slug = '';
+  const m = /\/product\/[^/]*?-(\d{5,})/.exec(String(d.url || ''));
+  if (m) slug = 'ozon-' + m[1];
+  else if (d.host) slug = String(d.host).replace(/[^\w.]+/g, '-');
+  const ver = String(d.version || '').replace(/[^\w.]+/g, '');
+  return (
+    'antisazar-report' + (ver ? '-' + ver : '') + (slug ? '-' + slug : '') + '.txt'
+  );
+}
+
+// Текстовый отчёт: сначала то, ради чего пишет человек (его слова и адрес
+// товара), затем отладочная информация целиком.
+function asgBuildReport(diag, userMessage) {
+  const d = diag || {};
+  const message = String(userMessage || '').slice(0, ASG_REPORT_MAX);
+  const url = String(d.url || '').trim();
+  const lines = [
+    'Сообщение об ошибке — АнтиСахар',
+    '='.repeat(42),
+    '',
+    'Комментарий:',
+    message || '(не указан)',
+    '',
+    'Страница товара:',
+    url || '(неизвестно)',
+    '',
+    '='.repeat(42),
+    'Отладочная информация (та же, что в кнопке «Диагностика»)',
+    '='.repeat(42),
+    ''
+  ];
+  try {
+    lines.push(JSON.stringify(d, null, 2));
+  } catch (e) {
+    lines.push('(не удалось разобрать диагностику: ' + e + ')');
+  }
+  return lines.join('\n');
+}
+
+// Письмо: тело короткое — в него входят слова пользователя и адрес товара.
+// Отчёт целиком пользователь вставляет сам: копирование в буфер надёжнее, чем
+// автоматическая отправка письма или скачивание файла (см. asgSendReport).
+function asgReportMail(diag, userMessage) {
+  const d = diag || {};
+  const message = String(userMessage || '').slice(0, ASG_REPORT_MAX);
+  const url = String(d.url || '').trim();
+  const file = asgReportFileName(d);
+  const first = message.split('\n')[0].trim();
+  const subject =
+    'АнтиСахар: проблема' + (first ? ' — ' + first.slice(0, 60) : '') +
+    (d.version ? ' (v' + d.version + ')' : '');
+  const body = [
+    message || '(без комментария)',
+    '',
+    'Страница товара:',
+    url || '(неизвестно)',
+    '',
+    'Полный отчёт о проверке сохранён в буфере обмена и ждёт вставки в это' +
+      ' письмо. В нём — что расширение нашло на странице и почему такой вывод.',
+    '',
+    'Отправлено из расширения «АнтиСахар» v' + (d.version || '?')
+  ].join('\n');
+  return { subject, body, file, href:
+    'mailto:' + ASG_REPORT_EMAIL +
+    '?subject=' + encodeURIComponent(subject) +
+    '&body=' + encodeURIComponent(body) };
+}
+
+// Копирование текста в буфер. Работает в интерфейсе расширения (попап,
+// настройки) — там есть document и navigator.clipboard.
+function asgCopyText(text) {
+  const ta = document.createElement('textarea');
+  ta.value = text;
+  ta.style.position = 'fixed';
+  ta.style.opacity = '0';
+  document.body.appendChild(ta);
+  ta.select();
+  let ok = false;
+  try {
+    ok = document.execCommand('copy');
+  } catch (e) {
+    ok = false;
+  }
+  ta.remove();
+  return ok;
+}
+
+// Запасной путь, когда свой сервер недоступен или отказал: копируем полный
+// текст отчёта в буфер и отдаём ссылку на письмо.
+//
+// Важно: ссылку открывает сам пользователь, нажатием. В 1.6.0 здесь стояли
+// window.open('mailto:…') и автоматическое скачивание файла — в сочетании с
+// закрывающимся попапом это приводило к падению браузера. Ни одна из этих
+// операций здесь больше не выполняется: расширение только готовит данные и
+// показывает ссылку.
+function asgSendReport(diag, userMessage) {
+  const mail = asgReportMail(diag, userMessage);
+  const report = asgBuildReport(diag, userMessage);
+  const copied = asgCopyText(report);
+  return {
+    copied: copied,
+    file: mail.file,
+    subject: mail.subject,
+    href: mail.href,
+    report: report
+  };
+}
 
 // Решение по верхней категории товара.
 //   'food'    — раздел из списка продовольственных, товар оцениваем;

@@ -22,6 +22,15 @@
     .row-btns { display: flex; gap: 8px; }
     .row-btns button { flex: 1; margin-top: 8px; }
     .row-btns button:disabled { opacity: .5; cursor: default; }
+    /* значок «сообщить о проблеме»: маленький, чтобы не спорить с основными кнопками */
+    button.icon { flex: 0 0 34px; font-size: 15px; line-height: 1; padding: 6px 0; }
+    button.icon:hover { background: #e4e7ec; }
+    textarea { width: 100%; box-sizing: border-box; margin-top: 8px; padding: 6px;
+      border: 1px solid #d0d5dd; border-radius: 6px; font: 12px/1.4 system-ui, Arial, sans-serif;
+      resize: vertical; }
+    /* письмо открывает пользователь, расширение его только готовит */
+    a.btn { display: block; margin-top: 8px; padding: 6px; border-radius: 6px;
+      background: #175cd3; color: #fff; text-align: center; text-decoration: none; font-size: 13px; }
     pre#diag-out { display: none; max-height: 240px; overflow: auto; background: #f2f4f7; border-radius: 6px; padding: 8px; font-size: 11px; white-space: pre-wrap; word-break: break-word; margin: 8px 0 0; }
   </style>
 </head>
@@ -45,6 +54,20 @@
   <div class="row-btns">
     <button id="diag">Диагностика</button>
     <button id="copy" disabled>Скопировать в буфер</button>
+    <button id="report-open" class="icon" title="Сообщить о проблеме"
+      aria-label="Сообщить о проблеме">✉</button>
+  </div>
+  <div id="report-form" style="display:none">
+    <textarea id="report-msg" rows="3" maxlength="500"
+      placeholder="Что не так с проверкой?"></textarea>
+    <div class="hint"><span id="report-count">0</span> / 500 символов</div>
+    <div class="row-btns">
+      <button id="report-send" class="primary">Отправить</button>
+      <button id="report-manual">Вручную</button>
+      <button id="report-cancel">Отмена</button>
+    </div>
+    <a id="report-link" class="btn" style="display:none" href="#">Открыть письмо</a>
+    <div id="report-msg-status" class="hint"></div>
   </div>
   <pre id="diag-out"></pre>
   <button id="options">Настройки...</button>

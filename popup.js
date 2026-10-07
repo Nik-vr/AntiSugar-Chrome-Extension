@@ -58,6 +58,100 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   };
 
+  // --- сообщение разработчику о проблеме -----------------------------------------
+  // Значок открывает короткую форму прямо в попапе: страница с товаром уже
+  // открыта, ничего переключать не нужно.
+  const reportForm = document.getElementById('report-form');
+  const reportMsg = document.getElementById('report-msg');
+  const reportCount = document.getElementById('report-count');
+  const reportStatus = document.getElementById('report-msg-status');
+  const reportLink = document.getElementById('report-link');
+
+  const updateCount = () => {
+    reportCount.textContent = String(reportMsg.value.length);
+  };
+  reportMsg.addEventListener('input', updateCount);
+  updateCount();
+
+  document.getElementById('report-open').onclick = () => {
+    reportStatus.textContent = '';
+    reportLink.style.display = 'none';
+    reportForm.style.display = reportForm.style.display === 'none' ? '' : 'none';
+    if (reportForm.style.display !== 'none') reportMsg.focus();
+  };
+  document.getElementById('report-cancel').onclick = () => {
+    reportForm.style.display = 'none';
+    reportStatus.textContent = '';
+  };
+// Основной путь — отправка на сервер разработчика. Адрес зашит в расширение,
+// пользователю настраивать ничего не надо.
+  document.getElementById('report-send').onclick = async () => {
+    const btn = document.getElementById('report-send');
+    btn.disabled = true;
+    reportLink.style.display = 'none';
+
+    const cfg = (await chrome.storage.local.get(ASG_DEFAULTS)) || {};
+    const endpoint = asgReportEndpoint(cfg);
+
+    if (!endpoint) {
+      reportStatus.textContent =
+        'Отправка отключена в настройках. Нажмите «Вручную», чтобы отправить письмом.';
+      btn.disabled = false;
+      return;
+    }
+
+    reportStatus.textContent = 'Отправляю...';
+    try {
+      const diag = await sendToTab({ type: 'asg-diag' });
+      if (!diag) throw new Error('страница не отвечает — откройте её и нажмите F5');
+
+      const res = await chrome.runtime.sendMessage({
+        type: 'report-send',
+        endpoint: endpoint,
+        payload: asgReportPayload(diag, reportMsg.value)
+      });
+
+      if (res && res.ok) {
+        reportMsg.value = '';
+        updateCount();
+        reportStatus.textContent = 'Отправлено. Спасибо!';
+      } else {
+        reportStatus.textContent =
+          'Не отправилось: ' + ((res && res.error) || 'неизвестная ошибка') +
+          '. Нажмите «Вручную», чтобы отправить письмом.';
+      }
+    } catch (e) {
+      reportStatus.textContent =
+        'Не получилось: ' + (e && e.message ? e.message : e) + '. Нажмите «Вручную».';
+    } finally {
+      btn.disabled = false;
+    }
+  };
+
+  // Запасной путь: без сервера. Отчёт в буфер, письмо — по ссылке.
+  document.getElementById('report-manual').onclick = async () => {
+    const btn = document.getElementById('report-send');
+    btn.disabled = true;
+    reportStatus.textContent = 'Готовлю...';
+    reportLink.style.display = 'none';
+    try {
+      const diag = await sendToTab({ type: 'asg-diag' });
+      if (!diag) throw new Error('страница не отвечает — откройте её и нажмите F5');
+      const res = asgSendReport(diag, reportMsg.value);
+      reportMsg.value = '';
+      updateCount();
+      reportLink.href = res.href;
+      reportLink.style.display = '';
+      reportStatus.textContent = res.copied
+        ? 'Отчёт в буфере. Нажмите «Открыть письмо» и вставьте отчёт в конец.'
+        : 'Отчёт не скопирован — приложите его из «Диагностики». Нажмите «Открыть письмо».';
+    } catch (e) {
+      reportStatus.textContent = 'Не получилось: ' + (e && e.message ? e.message : e);
+    } finally {
+      btn.disabled = false;
+    }
+  };
+
   // Копирование диагностики в буфер обмена
   let lastDiagText = '';
   async function copyText(text) {

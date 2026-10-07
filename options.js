@@ -14,12 +14,15 @@ document.addEventListener('DOMContentLoaded', async () => {
     'zone-red', 'zone-orange', 'zone-yellow', 'zone-green',
     'excludes', 'contextExcludes', 'hosts', 'sel-comp', 'sel-desc',
     'save', 'reset', 'save-msg',
-    'test-url', 'test-btn', 'test-out', 'clear-cache', 'cache-info'
+    'test-url', 'test-btn', 'test-out', 'clear-cache', 'cache-info',
+    'report-msg', 'report-count', 'report-btn', 'report-manual',
+    'report-msg-status', 'report-link', 'report-endpoint'
   ]) {
     els[id] = document.getElementById(id);
   }
 
-  fillFrom(await chrome.storage.local.get(ASG_DEFAULTS));
+  const saved = await chrome.storage.local.get(ASG_DEFAULTS);
+  fillFrom(saved);
   showCacheInfo();
 
   els.save.onclick = save;
@@ -36,6 +39,102 @@ document.addEventListener('DOMContentLoaded', async () => {
   els['clear-cache'].onclick = async () => {
     await chrome.runtime.sendMessage({ type: 'clear-cache' });
     els['cache-info'].textContent = 'кэш очищен';
+  };
+
+  // --- сообщение о проблеме ---
+  // Считаем введённое, чтобы человек видел, сколько осталось: лимит задан
+  // в разметке (maxlength), но счётчик нужен и для подсказки.
+  const countMsg = () => {
+    els['report-count'].textContent = String(els['report-msg'].value.length);
+  };
+  els['report-msg'].addEventListener('input', countMsg);
+  countMsg();
+
+  // Адрес можно переопределить для отладки, поэтому пишем его в настройки сразу
+  // при вводе. Пустое поле означает «использовать зашитый в расширение адрес».
+  const saveReportSettings = () => {
+    chrome.storage.local
+      .set({ reportEndpoint: els['report-endpoint'].value.trim() })
+      .catch(() => null);
+  };
+  els['report-endpoint'].addEventListener('change', saveReportSettings);
+
+  els['report-btn'].onclick = async () => {
+    const btn = els['report-btn'];
+    const status = els['report-msg-status'];
+    const link = els['report-link'];
+    btn.disabled = true;
+    link.style.display = 'none';
+
+    // Адрес зашит в расширение: пустое поле у пользователя не мешает отправке.
+    const endpoint = asgReportEndpoint({ reportEndpoint: els['report-endpoint'].value });
+
+    if (!endpoint) {
+      status.textContent =
+        'Отправка отключена — нажмите «Подготовить вручную», чтобы отправить письмом.';
+      btn.disabled = false;
+      return;
+    }
+    if (!asgReportEndpointOk(endpoint)) {
+      status.textContent = 'Адрес должен начинаться с https://';
+      btn.disabled = false;
+      return;
+    }
+
+    status.textContent = 'Отправляю...';
+    try {
+      saveReportSettings();
+      const tab = (await chrome.tabs.query({ active: true, currentWindow: true }))[0];
+      if (!tab || tab.id === undefined) throw new Error('нет вкладки');
+      const diag = await chrome.tabs.sendMessage(tab.id, { type: 'asg-diag' });
+      if (!diag) throw new Error('страница не отвечает — откройте её и нажмите F5');
+
+      const res = await chrome.runtime.sendMessage({
+        type: 'report-send',
+        endpoint: endpoint,
+        payload: asgReportPayload(diag, els['report-msg'].value)
+      });
+
+      if (res && res.ok) {
+        status.textContent = 'Отправлено. Спасибо!';
+        els['report-msg'].value = '';
+        countMsg();
+      } else {
+        status.textContent =
+          'Не отправилось: ' + ((res && res.error) || 'неизвестная ошибка') +
+          '. Нажмите «Подготовить вручную», чтобы отправить письмом.';
+      }
+    } catch (e) {
+      status.textContent =
+        'Не получилось: ' + (e && e.message ? e.message : e) +
+        '. Нажмите «Подготовить вручную».';
+    } finally {
+      btn.disabled = false;
+    }
+  };
+
+  // Запасной путь: без сервера. Отчёт в буфер, письмо — по ссылке.
+  els['report-manual'].onclick = async () => {
+    const status = els['report-msg-status'];
+    const link = els['report-link'];
+    status.textContent = 'Готовлю...';
+    link.style.display = 'none';
+    try {
+      const tab = (await chrome.tabs.query({ active: true, currentWindow: true }))[0];
+      if (!tab || tab.id === undefined) throw new Error('нет вкладки');
+      const diag = await chrome.tabs.sendMessage(tab.id, { type: 'asg-diag' });
+      if (!diag) throw new Error('страница не отвечает — откройте её и нажмите F5');
+      const res = asgSendReport(diag, els['report-msg'].value);
+      // Письмо открывает пользователь: расширение не переходит по mailto само,
+      // в 1.6.0 это приводило к падению браузера
+      link.href = res.href;
+      link.style.display = '';
+      status.textContent = res.copied
+        ? 'Отчёт скопирован в буфер. Нажмите «Открыть письмо» и вставьте отчёт в конец письма.'
+        : 'Отчёт не удалось скопировать — сохраните отчёт из блока «Диагностика». Нажмите «Открыть письмо».';
+    } catch (e) {
+      status.textContent = 'Не получилось: ' + (e && e.message ? e.message : e);
+    }
   };
 });
 
@@ -63,6 +162,10 @@ function fillFrom(s) {
   els.hosts.value = (s.hosts || []).join('\n');
   els['sel-comp'].value = ((s.selectors && s.selectors.composition) || []).join('\n');
   els['sel-desc'].value = ((s.selectors && s.selectors.description) || []).join('\n');
+  // Поле пустое, когда используется зашитый адрес: так видно, что настраивать
+// ничего не нужно, и случайная правка его не сломает.
+els['report-endpoint'].value =
+    s.reportEndpoint && s.reportEndpoint !== ASG_REPORT_ENDPOINT ? s.reportEndpoint : '';
 }
 
 function collect() {
@@ -86,7 +189,11 @@ function collect() {
     selectors: {
       composition: splitLines(els['sel-comp'].value),
       description: splitLines(els['sel-desc'].value)
-    }
+    },
+    // Пустое поле — используется зашитый в расширение адрес. Записываем именно
+    // пустую строку, а не значение по умолчанию: иначе при следующем обновлении
+    // адреса в коде старое значение из настроек продолжило бы перекрывать новое.
+    reportEndpoint: els['report-endpoint'].value.trim()
   };
 }
 

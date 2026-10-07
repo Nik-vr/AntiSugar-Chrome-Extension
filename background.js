@@ -554,6 +554,128 @@ async function analyzeUrl(url, force) {
   }
 }
 
+// --- отправка отчёта на свой сервер -----------------------------------------
+// Запрос идёт отсюда, а не из попапа: у service worker есть разрешение на
+// внешние адреса и он не закрывается вместе с окном. Из-за этого в 1.6.0 и
+// случилось падение — работа с закрывающимся документом.
+
+const REPORT_TIMEOUT_MS = 20000;
+
+/** Ошибки сервера переводим в понятный человеку текст. */
+const REPORT_ERRORS = {
+  token: 'сервер не принял ключ доступа — он настроен на закрытый режим',
+  origin: 'сервер не признал это расширение — проверьте ALLOWED_ORIGINS в config.php',
+  'content-type': 'сервер ждёт JSON — проверьте, что загружен именно report.php',
+  method: 'этот адрес не принимает отчёты (ожидается POST)',
+  'daily-limit': 'сервер сегодня уже набрал много отчётов — попробуйте позже',
+  'too-large': 'отчёт слишком большой для сервера',
+  json: 'сервер не понял формат запроса',
+  nothing: 'запрос оказался пустым',
+  'too-many': 'слишком много сообщений с этого адреса — попробуйте позже',
+  mail: 'сервер не смог отправить письмо (проверьте настройку почты у хостинга)',
+  'network': 'сервер недоступен',
+  'timeout': 'сервер не ответил вовремя'
+};
+
+async function reportFetch(endpoint, token, method, body) {
+  const headers = {};
+  // Ключ шлём, только если он задан. В обычном режиме сервер открыт, а ключ
+  // внутри расширения всё равно можно извлечь — требовать его от пользователя
+  // нечего.
+  if (token) headers['X-AntiSugar-Token'] = String(token);
+  if (method === 'POST') headers['Content-Type'] = 'application/json';
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), REPORT_TIMEOUT_MS);
+  try {
+    const res = await fetch(endpoint, {
+      method: method,
+      headers: headers,
+      body: method === 'POST' ? JSON.stringify(body) : undefined,
+      signal: controller.signal,
+      cache: 'no-store',
+      credentials: 'omit',
+      redirect: 'follow'
+    });
+    return res;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Проверка адреса до отправки: сервер должен ответить кодом отказа «нужен
+ * POST» или «нужен JSON». Так мы отличаем рабочий report.php от чужой
+ * страницы или опечатки в адресе.
+ *
+ * Ключ не передаётся: сервер в обычном режиме открыт, а Origin браузер
+ * подставит сам — расширение указывает его автоматически.
+ */
+async function checkReportEndpoint(endpoint) {
+  if (!asgReportEndpointOk(endpoint)) {
+    return { ok: false, error: 'адрес должен начинаться с https://' };
+  }
+  let res;
+  try {
+    res = await reportFetch(endpoint, '', 'GET');
+  } catch (e) {
+    const kind = e && e.name === 'AbortError' ? 'timeout' : 'network';
+    return { ok: false, error: REPORT_ERRORS[kind] };
+  }
+  if (res.status === 405) {
+    return { ok: true, note: 'сервер отвечает и ждёт POST — всё настроено' };
+  }
+  if (res.status === 415) {
+    return { ok: true, note: 'сервер отвечает и ждёт JSON — всё настроено' };
+  }
+  if (res.status === 403) {
+    return { ok: false, error: REPORT_ERRORS.origin };
+  }
+  return {
+    ok: false,
+    error: 'неожиданный ответ сервера: HTTP ' + res.status + ' — проверьте адрес'
+  };
+}
+
+/**
+ * Отправка отчёта. Возвращает {ok:true} либо {ok:false, error: текст}:
+ * интерфейс покажет текст и предложит запасной путь через буфер.
+ */
+async function sendReport(payload, endpoint) {
+  if (!asgReportEndpointOk(endpoint)) {
+    return { ok: false, error: 'адрес сервера не задан или не https://' };
+  }
+  const body = {
+    message: String(payload.message || '').slice(0, ASG_REPORT_MAX),
+    url: String(payload.url || '').slice(0, 2000),
+    host: String(payload.host || '').slice(0, 190),
+    version: String(payload.version || ASG_VERSION).slice(0, 32),
+    report: String(payload.report || '').slice(0, 120000)
+  };
+
+  let res;
+  try {
+    res = await reportFetch(endpoint, '', 'POST', body);
+  } catch (e) {
+    const kind = e && e.name === 'AbortError' ? 'timeout' : 'network';
+    return { ok: false, error: REPORT_ERRORS[kind] };
+  }
+
+  let data = null;
+  try {
+    data = await res.json();
+  } catch (e) {
+    data = null;
+  }
+
+  if (res.ok && data && data.ok) return { ok: true };
+
+  const code = data && data.error ? String(data.error) : '';
+  return {
+    ok: false,
+    error: REPORT_ERRORS[code] || 'сервер ответил HTTP ' + res.status
+  };
+}
+
 // --- сообщения ---
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
@@ -577,6 +699,10 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           error: cacheError || '',
           dirty: cacheDirty
         });
+      } else if (msg && msg.type === 'report-send') {
+        sendResponse(await sendReport(msg.payload || {}, msg.endpoint, msg.token));
+      } else if (msg && msg.type === 'report-check') {
+        sendResponse(await checkReportEndpoint(msg.endpoint));
       } else {
         sendResponse({ status: 'error', error: 'Неизвестный запрос' });
       }

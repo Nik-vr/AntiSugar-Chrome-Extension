@@ -19,10 +19,15 @@
     .actions { display: flex; gap: 8px; margin-top: 16px; align-items: center; }
     button { padding: 8px 16px; border-radius: 6px; border: 1px solid #d0d5dd; background: #f2f4f7; cursor: pointer; font-size: 14px; }
     button.primary { background: #175cd3; border-color: #175cd3; color: #fff; }
+    /* ссылка-кнопка: письмо открывает пользователь, расширение его только готовит */
+    a.btn { display: inline-block; padding: 8px 16px; border-radius: 6px; background: #175cd3;
+      border: 1px solid #175cd3; color: #fff; text-decoration: none; font-size: 14px; }
     #save-msg { color: #12b76a; font-weight: 600; }
     pre#test-out { background: #f2f4f7; border-radius: 6px; padding: 10px; font-size: 12px; white-space: pre-wrap; word-break: break-word; min-height: 40px; max-height: 320px; overflow: auto; }
     .test-row { display: flex; gap: 8px; }
     .test-row input { flex: 1; }
+    /* поле для тех, кто отлаживает: обычному пользователю не нужно */
+    label.advanced { color: #667085; font-size: 12px; }
     .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; vertical-align: baseline; }
     .dot-red { background: #d92d20; }
     .dot-orange { background: #f79009; }
@@ -107,6 +112,31 @@
   <fieldset>
     <legend>Проверка перед выпуском</legend>
     <div class="hint">Регрессионные тесты лежат <b>вне расширения</b> — в папке <b>tests</b> в корне проекта, рядом со скриптом публикации. Запуск одной командой: <b>node tests/run.cjs</b> — она прогоняет юнит-тесты и разбирает сохранённые карточки из <b>tests/cases.json</b>. Добавлять новый случай нужно туда же: в публикуемый пакет тестовые файлы не попадают.</div>
+  </fieldset>
+
+  <fieldset>
+    <legend>Сообщить о проблеме</legend>
+    <div class="hint">Отчёт уходит прямо на сервер разработчика: ни сторонних
+      сервисов, ни чужих почтовых провайдеров. Ничего настраивать не нужно —
+      нажмите «Отправить». Если сервер недоступен, отчёт скопируется в буфер,
+      а письмо откроется по готовой ссылке.</div>
+    <details style="margin:2px 0 8px">
+      <summary style="cursor:pointer;font-size:12px;color:#667085">Показать настройку для разработчика</summary>
+      <label class="advanced" style="margin-top:8px">Свой адрес сервера (для отладки)
+      <input type="text" id="report-endpoint" autocomplete="off" spellcheck="false"
+        placeholder="https://lab.petrochenko.ru/antisahar/report.php"></label>
+      <div class="hint">Пусто — используется адрес, зашитый в расширение.
+        Он работает сразу, без всякой настройки.</div>
+    </details>
+    <textarea id="report-msg" rows="3" maxlength="500"
+      placeholder="Что не так: например, «состав не найден, хотя он есть на странице»"></textarea>
+    <div class="hint"><span id="report-count">0</span> / 500 символов</div>
+    <div class="actions" style="margin-top:8px">
+      <button id="report-btn" class="primary">Отправить</button>
+      <button id="report-manual">Подготовить вручную</button>
+      <a id="report-link" class="btn" style="display:none" href="#">Открыть письмо</a>
+      <span id="report-msg-status" class="hint"></span>
+    </div>
   </fieldset>
 
   <div class="actions">
