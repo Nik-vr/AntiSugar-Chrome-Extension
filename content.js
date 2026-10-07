@@ -6,38 +6,46 @@
   window.__ASG_LOADED__ = true;
 
   const BADGE_ATTR = 'asg-safety-badge';
-  const PRODUCT_PATH_RE = /\/(product|catalog|card)\//i;
-  const WATCH_MS = 20000; // окно наблюдения за до-рендером
+  const WATCH_MS = 12000; // окно наблюдения за до-рендером
   const AWAIT_COMPOSITION_MS = 8000; // сколько ждём первый достоверный состав,
-  // прежде чем показать серый «состав не найден»
-  const COMPOSE_WAIT_MS = 40000; // сколько ждём блок «Состав» после окна наблюдения
+  // прежде чем показать «проверяем состав…»
+  const COMPOSE_WAIT_MS = 18000; // сколько ждём блок «Состав» после окна наблюдения
   const COMPOSE_PROBE_MS = 1000; // как часто проверять появление состава в этом ожидании
-  const POLL_MS = 400; // как часто проверяем, изменился ли текст
+  const POLL_MS = 1000; // медленный опрос: адрес, окна наблюдения
   const QUIET_MS = 1200; // столько страница должна быть «тихой» перед показом цвета
   const SETTLE_MS = 3000; // после этой тишины выборка считается финальной
-  const RENDER_DELTA = 200; // минимальный прирост текста для повторной проверки
+  const MUTATION_DEBOUNCE_MS = 400; // пауза после изменений DOM перед реакцией
+  const REACT_MIN_MS = 600; // не чаще одной реакции на изменения страницы
+  const LATE_CHECK_MS = 3000; // как часто проверять поздно дорисованный состав
+  const LATE_WATCH_MS = 300000; // сколько следим за ним после вердикта (5 мин)
   const LOCAL_TEXT_MIN = 250; // меньше — пробуем догрузить страницу целиком
+  const SEND_TIMEOUT_MS = 15000; // сколько ждём ответ фона на обычный запрос
+  const SEND_TIMEOUT_LOAD_MS = 45000; // догрузка страницы в фоне: до 30 с вкладка + запрос
 
-  const ZONE_ORDER = ['red', 'orange', 'yellow', 'green'];
-  const ZONE_LABEL = {
-    red: 'Зона высокого риска',
-    orange: 'Зона обмана и скрытых угроз',
-    yellow: 'Зона компромиссов',
-    green: 'Зона безопасности'
-  };
-  const ZONE_SHORT = {
-    red: 'Высокий риск',
-    orange: 'Скрытые угрозы',
-    yellow: 'Компромиссы',
-    green: 'Безопасно'
-  };
-  const ZONE_ICON = { red: '!', orange: '!', yellow: '!', green: '✓' };
+  // Карточка ли это товара. У известных маркетплейсов формат URL свой: общая
+  // проверка «есть /product/ или /catalog/» ломалась и на Мarketе
+  // (/product--slug/123), и на листингах Ozon (/catalog/elektronika/).
+  const PRODUCT_PATH_RULES = [
+    { host: 'ozon.ru', re: /^\/product[-/]/i },
+    { host: 'wildberries.ru', re: /\/catalog\/\d+\/detail/i },
+    { host: 'market.yandex.ru', re: /^\/product--|^\/product\//i }
+  ];
+  // Признаки карточки и раздела в URL — для сайтов вне списка выше
+  const GENERIC_PRODUCT_PATH_RE = /(product|good|item|tovar|card|detail|offer)/i;
+  const LIST_PATH_RE =
+    /\/(catalog|category|categories|search|brand|collection|shop|tag|filter|promo)(\/|$)/i;
+
+  const ZONE_ORDER = ASG_ZONE_ORDER;
+  const ZONE_LABEL = ASG_ZONE_LABEL;
+  const ZONE_SHORT = ASG_ZONE_SHORT;
+  const ZONE_ICON = ASG_ZONE_ICON;
 
   let settings = null;
   const errors = [];
   let state = { status: 'idle' };
   let lastExtract = null;
   let busy = false;
+  let pendingAnalyze = null; // запрос, пришедший во время работы
   let fallbackTried = false;
   let lastHref = null;
   let lastBodyLen = 0;
@@ -45,14 +53,22 @@
   let lastAnalyzedAt = 0;
   let watchUntil = 0;
   let composeWaitUntil = 0;
-let awaitUntil = 0;
+  let awaitUntil = 0;
+  let lateWatchUntil = 0;
   let composeProbeAt = 0;
+  let lastReactAt = 0;
   let watching = false;
   let pollTimer = null;
-  let recheckTimer = null;
+  let mutationObserver = null;
+  let mutationTimer = null;
   let lastRenderedConfirmed = null;
   let lastPanel = false;
   let lastFinal = false;
+  // Показывали ли уже цвет по настоящему составу (см. isConfirmed)
+  let confirmedShown = false;
+  // Кэш ответа «есть ли на странице подпись „Состав“»: проверка обходит DOM,
+  // а спрашивают о ней часто (isConfirmed вызывается на каждом тике)
+  let labelProbe = { at: 0, len: -1, present: false };
 
   // --- служебное ---
 
@@ -87,64 +103,159 @@ let awaitUntil = 0;
     });
   }
 
-  function isFoodCategory(name) {
-    const n = String(name || '').trim().toLowerCase();
-    const cats = (settings && settings.foodCategories
-      ? settings.foodCategories
-      : [])
-      .map((c) => String(c).trim().toLowerCase())
-      .filter(Boolean);
-    if (!n || !cats.length) return true;
-    return cats.some((c) => n.includes(c));
+  function categoryDecision(name) {
+    return asgCategoryDecision(
+      name,
+      (settings && settings.foodCategories) || ASG_DEFAULTS.foodCategories,
+      (settings && settings.nonFoodCategories) || ASG_DEFAULTS.nonFoodCategories
+    );
+  }
+
+  // Микроразметка товара (JSON-LD Product) — надёжный признак карточки на
+  // сайте, для которого у нас нет правила по URL.
+  function hasProductMarkup() {
+    try {
+      const scripts = document.querySelectorAll('script[type="application/ld+json"]');
+      for (const s of scripts) {
+        let data;
+        try {
+          data = JSON.parse(s.textContent);
+        } catch (e) {
+          continue;
+        }
+        const items = Array.isArray(data) ? data : [data];
+        for (const it of items) {
+          if (!it || typeof it !== 'object') continue;
+          const t = Array.isArray(it['@type']) ? it['@type'] : [it['@type']];
+          for (const x of t) {
+            if (String(x || '').toLowerCase() === 'product') return true;
+          }
+        }
+      }
+    } catch (e) { /* ignore */ }
+    return false;
   }
 
   function isProductPage() {
+    let host = '';
+    let path = '';
     try {
-      return PRODUCT_PATH_RE.test(location.pathname);
+      host = location.hostname.toLowerCase();
+      path = location.pathname;
     } catch (e) {
       return false;
     }
+    for (const rule of PRODUCT_PATH_RULES) {
+      if (host === rule.host || host.endsWith('.' + rule.host)) return rule.re.test(path);
+    }
+    // Сайт из настроек, но с незнакомой разметкой URL
+    if (GENERIC_PRODUCT_PATH_RE.test(path)) return true;
+    if (LIST_PATH_RE.test(path)) return false;
+    return hasProductMarkup();
   }
 
-  function send(msg) {
-    return chrome.runtime.sendMessage(msg).catch((e) => ({
-      status: 'error',
-      error: String(e)
-    }));
+  // Ответ фона обязателен: без таймаута выгруженный service worker оставлял бы
+  // промис незавершённым навсегда, а ждать его бесконечно нельзя — иначе busy
+  // не сбросится и значок навсегда застрянет на «Проверяю состав…».
+  function send(msg, timeoutMs) {
+    const limit = timeoutMs || SEND_TIMEOUT_MS;
+    return new Promise((resolve) => {
+      let done = false;
+      const finish = (value) => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        resolve(value);
+      };
+      const timer = setTimeout(
+        () => finish({ status: 'error', error: 'фон не ответил за ' + limit + ' мс' }),
+        limit
+      );
+      let p;
+      try {
+        p = chrome.runtime.sendMessage(msg);
+      } catch (e) {
+        finish({ status: 'error', error: String(e) });
+        return;
+      }
+      Promise.resolve(p).then(
+        (r) => finish(r),
+        (e) => finish({ status: 'error', error: String(e) })
+      );
+    });
   }
 
+  // Длина текста документа — признак «страница растёт». Полный textContent
+  // тела на тяжёлой карточке Ozon занимает миллисекунды, а спрашивается на
+  // каждой пачке изменений DOM, поэтому держим оценку и правим её по мутациям.
+  // Точное значение пересчитываем при смене товара и при переходе через SPA.
+  let bodyLen = 0;
+  function bodyLenExact() {
+    bodyLen = document.body ? (document.body.textContent || '').length : 0;
+    return bodyLen;
+  }
+  function bodyLenApply(records) {
+    for (const rec of records) {
+      for (const n of rec.addedNodes || []) {
+        if (n.nodeType === 1 && n.hasAttribute && n.hasAttribute(BADGE_ATTR)) continue;
+        bodyLen += (n.textContent || '').length;
+      }
+      for (const n of rec.removedNodes || []) {
+        if (n.nodeType === 1 && n.hasAttribute && n.hasAttribute(BADGE_ATTR)) continue;
+        bodyLen -= (n.textContent || '').length;
+      }
+    }
+    return bodyLen;
+  }
   function bodyTextLen() {
-    return document.body ? (document.body.textContent || '').length : 0;
+    return bodyLen;
   }
 
-// --- подтверждение результата ---
-// Цвет не показываем, пока не убедимся, что состав собран полностью:
-// найден настоящий блок «Состав», страница догружена целиком или текст устоялся.
-// Это правило симметрично: и ложный зелёный, и ложный красный вредны,
-// поэтому предварительный вердикт по обрывочным данным не показывается.
-function isSettled() {
-  const now = Date.now();
-  return now - lastGrowthAt >= SETTLE_MS && now - lastAnalyzedAt >= SETTLE_MS;
-}
+  // --- подтверждение результата ---
+  // Цвет не показываем, пока не убедимся, что состав собран полностью:
+  // найден настоящий блок «Состав», страница догружена целиком или текст устоялся.
+  // Это правило симметрично: и ложный зелёный, и ложный красный вредны,
+  // поэтому предварительный вердикт по обрывочным данным не показывается.
+  function isSettled() {
+    const now = Date.now();
+    return now - lastGrowthAt >= SETTLE_MS && now - lastAnalyzedAt >= SETTLE_MS;
+  }
 
-// Страница «успокоилась»: текст не менялся последние QUIET_MS.
-function isQuiet() {
-  return Date.now() - lastGrowthAt >= QUIET_MS;
-}
+  // Страница «успокоилась»: текст не менялся последние QUIET_MS.
+  function isQuiet() {
+    return Date.now() - lastGrowthAt >= QUIET_MS;
+  }
 
-// --- подтверждение результата ---
-// Цвет не показываем, пока страница не «успокоится»: первый разбор нередко
-// попадает на промежуточное состояние DOM (например, у товара сначала виден
-// один блок «Состав», а через секунду рендерится другой). Правило симметрично:
-// и ложный зелёный, и ложный красный вредны.
-function isConfirmed(r) {
-  if (!r || r.status === 'pending' || r.status === 'idle') return false;
-  if (r.status !== 'ok') return true; // ошибка — показываем сразу
-  if (r.skipped) return true; // «не продукты» — показываем сразу
-  if (lastFinal) return true; // текст окончательно устоялся и пересчитан
-  if (r.authoritative && isQuiet()) return true; // настоящий состав + страница тихая
-  return false;
-}
+  // --- подтверждение результата ---
+  // Цвет не показываем, пока страница не «успокоится»: первый разбор нередко
+  // попадает на промежуточное состояние DOM (например, у товара сначала виден
+  // один блок «Состав», а через секунду рендерится другой). Правило симметрично:
+  // и ложный зелёный, и ложный красный вредны.
+  // Вердикт «состав не найден» тоже показывается только после окна наблюдения:
+  // пока оно идёт, на значке «Проверяю состав…». Соблазн показать серую оценку
+  // раньше («подписи на странице нет — ждать нечего») уже приводил к ошибке:
+  // Ozon дорисовывает описание и блок «Состав» при прокрутке, и на карточке
+  // вафель расширение успевало сказать «состав не найден» по полудорисованной
+  // странице. Если состав появится позже, значок обновится сам — за этим
+  // следит MutationObserver, а не окно наблюдения.
+  function isConfirmed(r) {
+    if (!r || r.status === 'pending' || r.status === 'idle') return false;
+    if (r.status !== 'ok') return true; // ошибка — показываем сразу
+    if (r.skipped) return true; // «не продукты» — показываем сразу
+    if (lastFinal) return true; // текст окончательно устоялся и пересчитан
+    // Показанное подтверждение держится: рост страницы после вердикта (отзывы,
+    // рекомендации, ленивые картинки) — это не повод отбирать флаг назад.
+    // Иначе значок мигает «Проверяю состав…» → флаг → «Проверяю состав…».
+    // Показанное подтверждение держится: рост страницы после вердикта (отзывы,
+    // рекомендации, ленивые картинки) — это не повод отбирать флаг назад.
+    // Иначе значок мигает «Проверяю состав…» → флаг → «Проверяю состав…».
+    if (r.authoritative && confirmedShown) return true;
+    if (r.authoritative && isQuiet()) {
+      confirmedShown = true;
+      return true;
+    }
+    return false;
+  }
 
   // --- значок ---
 
@@ -180,7 +291,7 @@ function isConfirmed(r) {
   }
 
   // Нашлось ли хоть что-то: нужно, чтобы показывать находки даже без цвета
-function hasMatches(r) {
+  function hasMatches(r) {
     if (!r || !r.zones) return false;
     for (const z of ZONE_ORDER) {
       if ((r.zones[z] || []).length) return true;
@@ -188,10 +299,90 @@ function hasMatches(r) {
     return false;
   }
 
+  // Подсветка найденных компонентов прямо в тексте состава: слово выделяется
+  // цветом своей зоны риска. Ищем и по найденной форме слова («мальтита»), и по
+  // ключевому слову («мальтит»), но только на границе слова — иначе «мёд»
+  // подсветился бы внутри «мёда», а «сахар» внутри «сахарозы».
+  function highlightHtml(text, matches) {
+    const plain = String(text || '');
+    if (!plain || !matches || !matches.length) return esc(plain);
+    const isWordChar = (c) => /[a-zа-яё0-9]/i.test(c);
+    const lower = plain.toLowerCase();
+    const ranges = [];
+    const seenNeedle = {};
+    for (const m of matches) {
+      const zone = ZONE_ORDER.indexOf(m.zone) !== -1 ? m.zone : null;
+      if (!zone) continue;
+      const needles = [];
+      for (const w of [m.word, m.keyword]) {
+        const v = String(w || '').toLowerCase();
+        if (v && v.length >= 3 && !seenNeedle[v + '|' + zone]) {
+          seenNeedle[v + '|' + zone] = true;
+          needles.push(v);
+        }
+      }
+      for (const needle of needles) {
+        let from = 0;
+        while (from <= lower.length - needle.length) {
+          const at = lower.indexOf(needle, from);
+          if (at === -1) break;
+          const after = plain.charAt(at + needle.length);
+          if (!isWordChar(plain.charAt(at - 1)) && !isWordChar(after)) {
+            ranges.push({ start: at, end: at + needle.length, zone });
+          }
+          from = at + needle.length;
+        }
+      }
+    }
+    if (!ranges.length) return esc(plain);
+    // Перекрывающиеся подсветки несовместимы: оставляем самое длинное
+    // («изомальтоолигосахарид» целиком, а не его начало)
+    ranges.sort((a, b) => b.end - b.start - (a.end - a.start) || a.start - b.start);
+    const keep = [];
+    for (const r of ranges) {
+      if (keep.some((k) => r.start < k.end && r.end > k.start)) continue;
+      keep.push(r);
+    }
+    keep.sort((a, b) => a.start - b.start);
+    let out = '';
+    let pos = 0;
+    for (const r of keep) {
+      out +=
+        esc(plain.slice(pos, r.start)) +
+        '<span class="hl z-' + r.zone + '">' + esc(plain.slice(r.start, r.end)) + '</span>';
+      pos = r.end;
+    }
+    return out + esc(plain.slice(pos));
+  }
+
   function renderBadge(res) {
+    // Прокрутку панели сохраняем: значок собирается заново, и без этого
+    // открытая панель каждый раз прыгала бы в начало
+    const prev = badgeEl();
+    const prevScroll =
+      prev && prev.shadowRoot
+        ? {
+            panel: (prev.shadowRoot.querySelector('.panel') || {}).scrollTop || 0,
+            comp: (prev.shadowRoot.querySelector('.comp') || {}).scrollTop || 0
+          }
+        : null;
     removeBadge();
     const r = res || { status: 'idle' };
     const confirmed = isConfirmed(r);
+
+    // До первого ответа фона плашки нет. Иначе на непищевой карточке мигало бы
+    // «Проверяю состав…» — и только через секунду выяснялось бы, что товар не
+    // еда и плашка исчезает. Видимая активность допустима только на страницах
+    // продуктов питания, а выяснить это можно лишь по результату проверки.
+    if (r.status === 'pending' || r.status === 'idle') {
+      lastRenderedConfirmed = confirmed;
+      return;
+    }
+
+    // До первого ответа фона плашки нет. Иначе на непищевой карточке мигало бы
+    // «Проверяю состав…» — и только через секунду выяснялось бы, что товар не
+    // еда и плашка исчезает. Видимая активность допустима только на страницах
+    // продуктов питания, а выяснить это можно лишь по результату проверки.
 
     let icon = '';
     let cls = 'b-wait';
@@ -200,10 +391,14 @@ function hasMatches(r) {
     let zone = null;
 
     if (r.status === 'ok' && r.skipped) {
-      icon = '–';
-      cls = 'b-gray';
-      label = 'Не продукты';
-    } else if (r.status === 'ok' && confirmed) {
+      // На непищевых страницах значок не показываем вовсе: расширение про
+      // состав еды, и серая плашка «Не продукты» на каждой странице одежды
+      // или электроники только мешает. Ответ виден в попапе.
+      removeBadge();
+      lastRenderedConfirmed = confirmed;
+      return;
+    }
+    if (r.status === 'ok' && confirmed) {
       zone = ZONE_ORDER.indexOf(r.zone) !== -1 ? r.zone : 'green';
       if (zone === 'green' && settings && settings.markClean === false) return;
       // Цвет ставится только по достоверному составу — найденному по подписи
@@ -215,7 +410,10 @@ function hasMatches(r) {
       if (r.authoritative !== true) {
         icon = '?';
         cls = 'b-gray';
-        label = r.source === 'состав' ? 'Состав не подтверждён' : 'Состав не найден';
+        // Если слова найдены, но не в блоке «Состав», говорить «не найден»
+        // нельзя: панель и попап показывают список находок, и плашка
+        // противоречила бы им. Не подтверждено — честная формулировка.
+        label = hasMatches(r) ? 'Состав не подтверждён' : 'Состав не найден';
         zone = null;
       } else {
         icon = ZONE_ICON[zone];
@@ -239,52 +437,88 @@ function hasMatches(r) {
     }
 
     const lines = [];
-    if (zone || (r.status === 'ok' && r.skipped)) {
-      lines.push(
-        '<div class="row"><span>Источник</span><b>' +
-          esc(
-            r.source === 'состав'
-              ? 'блок «Состав»'
-              : r.source === 'описание'
-              ? 'блок «Описание»'
-              : r.source === 'страница'
-              ? 'текст страницы'
-              : '—'
-          ) +
-          '</b></div>'
-      );
-      if (r.cached) lines.push('<div class="row"><span>Кэш</span><b>да</b></div>');
-    }
+    // Строка «Источник: блок «Состав»» убрана: источник и так назван в
+    // заголовке проверяемого текста («Состав — что проверяли» / «Описание — …»),
+    // а повторялась она ещё и внизу панели. Пометку о кэше переносим вниз, к
+    // прочим служебным пометкам, чтобы панель начиналась с сути.
 
-    // Всегда показываем, какой именно текст проверяли — в том числе при зелёном
+    // Проблемные компоненты — красная, оранжевая и жёлтая зоны. Зелёная зона
+    // проблемой не является: стевия и подобное подсвечены в самом составе.
+    const problemZones = ['red', 'orange', 'yellow'];
+    const hasProblems = problemZones.some(
+      (z) => ((r.zones && r.zones[z]) || []).length > 0
+    );
+
+    // Полный блок проверяемого текста: собираем здесь, а вставляем под находки —
+    // так панель читается как «вердикт → что нашли → в каком тексте». Раньше
+    // один и тот же состав показывался дважды: полным текстом и фрагментом.
     const analyzed = analyzedText(r.source);
-    if (analyzed.text) {
+    const what =
+      r.source === 'состав'
+        ? 'Состав — что проверяли'
+        : r.source === 'описание'
+        ? 'Описание — что проверяли'
+        : 'Текст страницы — что проверяли';
+    const found = [];
+    for (const z of ZONE_ORDER) {
+      for (const m of (r.zones && r.zones[z]) || []) {
+        found.push({ zone: z, word: m.word, keyword: m.keyword });
+      }
+    }
+    const analyzedBlock = () => {
+      if (!analyzed.text) return [];
       const cut = analyzed.text.length > COMPOSITION_PREVIEW;
-      lines.push(
-        '<div class="zh">' +
-          (r.source === 'страница' ? 'Текст страницы — что проверяли' : 'Состав — что проверяли') +
-          '</div>' +
-          '<div class="comp">' + esc(analyzed.text) + (cut ? '…' : '') + '</div>' +
-          (cut
-            ? '<div class="cnt">показаны первые ' + COMPOSITION_PREVIEW +
-              ' символов из ' + analyzed.len + '</div>'
-            : '')
-      );
+      return [
+        '<div class="zh">' + what + '</div>',
+        '<div class="comp">' + highlightHtml(analyzed.text, found) + (cut ? '…' : '') + '</div>',
+        cut
+          ? '<div class="cnt">показаны первые ' + COMPOSITION_PREVIEW + ' символов из ' +
+            analyzed.len + '</div>'
+          : ''
+      ];
+    };
+
+    if (r.status === 'ok' && r.authoritative !== true) {
+      const e = lastExtract || {};
+      let why;
+      if (r.source === 'состав') {
+        // Состав найден, но вердикт не подтверждён. Объясняем настоящую
+        // причину: раньше здесь всегда писалось «слова найдены в описании»,
+        // даже когда источником был блок «Состав».
+        why =
+          r.trustedComposition === false
+            ? 'Состав собран по тексту страницы, а не из блока «Состав» — как ' +
+              'доказательство такой текст не годится.'
+            : 'Блок «Состав» найден, но перечень выглядит неполным или обрезанным, ' +
+              'а опасных веществ в нём не найдено. Утверждать безопасность по такому ' +
+              'тексту нельзя — сверьтесь с упаковкой.';
+      } else {
+        why =
+          'Цвет не показываем: эти слова найдены не в составе, а в ' +
+          (r.source === 'описание' ? 'описании товара' : 'тексте страницы') +
+          '. Надёжная оценка — только по блоку «Состав».';
+      }
+      lines.push('<div class="cnt">' + esc(why) + '</div>');
+      if (r.source === 'состав' && e.composition) {
+        const detail =
+          'разобрано символов: ' + String(e.composition).length +
+          ', компонентов: ' + (e.compositionParts || 0) +
+          (e.compositionWellFormed === false ? ', перечень не завершён' : '') +
+          (e.compositionBrackets && e.compositionBrackets.depth > 0
+            ? ' (не закрыта скобка)'
+            : '');
+        lines.push('<div class="cnt">' + esc(detail) + '</div>');
+      }
     }
 
-    if (r.status === 'ok' && r.authoritative !== true && !r.skipped) {
-      lines.push(
-        '<div class="cnt">Цвет не показываем: эти слова найдены не в составе, а в ' +
-          'описании товара. Надёжная оценка — только по блоку «Состав».</div>'
-      );
-    }
-
-    if (r.status === 'ok' && (zone || hasMatches(r))) {
-      for (const z of ZONE_ORDER) {
+    if (r.status === 'ok' && hasProblems) {
+      // Заголовок появляется только когда ниже действительно перечисляются
+      // проблемные ингредиенты. Если находок нет, панель состоит только из
+      // проверяемого состава — пустого заголовка быть не должно.
+      lines.push('<div class="zh">На что обратить внимание:</div>');
+      for (const z of problemZones) {
         const ms = (r.zones && r.zones[z]) || [];
         if (!ms.length) continue;
-        // Показываем все зоны, а не только старшую: сорбитол в «скрытых
-        // угрозах» не должен пропадать из-за аспартама в «высоком риске»
         lines.push('<div class="zh z-' + z + '">' + esc(ZONE_LABEL[z]) + '</div>');
         for (const m of ms) {
           // найденное слово из состава, если оно отличается от названия
@@ -305,20 +539,25 @@ function hasMatches(r) {
           );
         }
       }
-      if (r.snippet) lines.push('<div class="snip">' + esc(r.snippet) + '</div>');
-      if (!zone && hasMatches(r)) {
-        lines.push(
-          '<div class="snip">Оценка по описанию: эти компоненты упомянуты в тексте ' +
-            'товара, но не подтверждены блоком «Состав».</div>'
-        );
-      }
-      if (!zone && !hasMatches(r)) {
-        lines.push(
-          '<div class="snip">Блок «Состав» на странице не найден или не подтверждён. ' +
-            'Опасные вещества в тексте страницы не обнаружены, но это не доказывает ' +
-            'их отсутствие в составе — проверьте упаковку.</div>'
-        );
-      }
+    }
+
+    // Проверенный текст — сразу под находками, с подсветкой найденных слов.
+    // Показываем всегда, в том числе при зелёном флаге: это то, что проверяли,
+    // и без него «Безопасно» выглядит голословным.
+    lines.push(...analyzedBlock());
+
+    if (r.status === 'ok' && !zone && hasMatches(r)) {
+      lines.push(
+        '<div class="snip">Оценка по описанию: эти компоненты упомянуты в тексте ' +
+          'товара, но не подтверждены блоком «Состав».</div>'
+      );
+    }
+    if (r.status === 'ok' && !zone && !hasMatches(r)) {
+      lines.push(
+        '<div class="snip">Блок «Состав» на странице не найден или не подтверждён. ' +
+          'Опасные вещества в тексте страницы не обнаружены, но это не доказывает ' +
+          'их отсутствие в составе — проверьте упаковку.</div>'
+      );
     }
 
     if (!confirmed && r.status === 'ok') {
@@ -326,12 +565,10 @@ function hasMatches(r) {
         '<div class="snip">Ждём, пока страница догрузит состав — итог может уточниться.</div>'
       );
     }
-    if (r.status === 'ok' && r.skipped) {
-      lines.push(
-        '<div class="snip">Категория «' +
-          esc(r.reason || '?') +
-          '» — анализ не проводился.</div>'
-      );
+    // Пометка о кэше — внизу, вместе с прочими служебными: наверху панель
+    // начинается с сути, а не со служебных надписей.
+    if (zone && r.cached) {
+      lines.push('<div class="cnt">Показан кэшированный вердикт.</div>');
     }
     if (r.status === 'error') {
       lines.push('<div class="snip">' + esc(r.error || 'ошибка') + '</div>');
@@ -361,8 +598,14 @@ function hasMatches(r) {
       '.cmp{margin:3px 0 5px;padding-left:8px;border-left:2px solid #e4e7ec}' +
       '.cmp span{color:#475467}' +
       '.comp{margin-top:2px;padding:6px 8px;background:#f9fafb;border:1px solid #e4e7ec;' +
-      'border-radius:6px;color:#344054;max-height:130px;overflow:auto;white-space:pre-wrap;' +
-      'word-break:break-word}' +
+      'border-radius:6px;color:#344054;max-height:150px;overflow:auto;white-space:pre-wrap;' +
+      'word-break:break-word;line-height:1.55}' +
+      // подсветка найденных компонентов прямо в тексте состава
+      '.hl{border-radius:3px;padding:0 2px;font-weight:700}' +
+      '.hl.z-red{background:#fee4e2;color:#b42318}' +
+      '.hl.z-orange{background:#fef0c7;color:#b54708}' +
+      '.hl.z-yellow{background:#fff6c9;color:#7a5300}' +
+      '.hl.z-green{background:#dcfae6;color:#067647}' +
       '.cnt{margin-top:2px;color:#98a2b3;font-size:11px}' +
       '.snip{margin-top:6px;color:#475467;font-size:12px;word-break:break-word}' +
       '.again{margin-top:8px;width:100%;padding:5px;border:1px solid #d0d5dd;border-radius:6px;' +
@@ -389,12 +632,22 @@ function hasMatches(r) {
     });
 
     (document.body || document.documentElement).appendChild(host);
+    if (prevScroll) {
+      const panelNew = root.querySelector('.panel');
+      const compNew = root.querySelector('.comp');
+      if (panelNew) panelNew.scrollTop = prevScroll.panel;
+      if (compNew) compNew.scrollTop = prevScroll.comp;
+    }
     lastRenderedConfirmed = confirmed;
   }
 
   function updateBadge(force) {
     const conf = isConfirmed(state);
-    if (!force && conf === lastRenderedConfirmed) return;
+    if (!force && conf === lastRenderedConfirmed) {
+      // Значок мог исчезнуть вместе с перестроенным DOM страницы: тогда его
+      // нужно вернуть. Исключение — непищевые страницы, где значка нет намеренно.
+      if (badgeEl() || (state && state.skipped)) return;
+    }
     renderBadge(state);
   }
 
@@ -402,13 +655,25 @@ function hasMatches(r) {
 
   // На странице есть подпись «Состав», а значения пока нет: блок ещё подгружается.
   // Если подписи на странице нет вовсе — ждать нечего.
+  // Ответ кэшируется: проверка обходит DOM, а спрашивают о ней на каждом тике.
   function asgCompositionLabelPresent() {
     if (!lastExtract || lastExtract.hasComposition) return false;
-    try {
-      return asgProbeComposition(document).labeled.length > 0;
-    } catch (e) {
-      return false;
+    const now = Date.now();
+    if (
+      labelProbe.at &&
+      now - labelProbe.at < COMPOSE_PROBE_MS &&
+      labelProbe.len === lastBodyLen
+    ) {
+      return labelProbe.present;
     }
+    let present = false;
+    try {
+      present = asgHasCompositionLabel(document);
+    } catch (e) {
+      present = false;
+    }
+    labelProbe = { at: now, len: lastBodyLen, present };
+    return present;
   }
 
   // Показывать вердикт рано опасно: пока блок «Состав» не подгрузился, товар
@@ -424,25 +689,47 @@ function hasMatches(r) {
   }
 
   async function analyze(force, final) {
-    if (busy) return;
+    if (busy) {
+      // Запрос, пришедший во время работы, не теряем: иначе кнопка
+      // «Перепроверить» и пересчёт после смены настроек молча ничего не делали бы
+      pendingAnalyze = {
+        force: !!force || !!(pendingAnalyze && pendingAnalyze.force),
+        final: !!final || !!(pendingAnalyze && pendingAnalyze.final)
+      };
+      return;
+    }
     busy = true;
     try {
+      // Полный текст страницы собирается извлекателем только когда
+      // подтверждённого состава нет — ровно тогда, когда он может стать
+      // источником в фоне. Диагностика запрашивает его принудительно.
       const data = asgExtractFromDoc(document, settings);
       lastExtract = data;
       lastBodyLen = bodyTextLen();
       lastAnalyzedAt = Date.now();
+
+      // Фон берёт ровно один источник (pickSource), поэтому полный текст
+      // страницы отправляем только тогда, когда он может понадобиться: 20 КБ
+      // на каждый пересчёт — это лишняя нагрузка на IPC и структурное клонирование.
+      const needFallback = !(
+        settings &&
+        settings.preferComposition !== false &&
+        data.authoritative
+      );
 
       let res = await send({
         type: 'analyze',
         product: {
           url: location.href,
           composition: data.composition,
-          description: data.description,
+          description: needFallback ? data.description : '',
           topCategory: data.topCategory,
           topCategoryReliable: !!data.topCategoryReliable,
-          pageText: data.pageText,
+          pageText: needFallback ? data.pageText : '',
           confident: !!data.confident,
           authoritative: !!data.authoritative,
+          compositionTrusted: !!data.compositionTrusted,
+          materialComposition: !!data.materialComposition,
           final: !!final,
           force: !!force
         }
@@ -453,13 +740,17 @@ function hasMatches(r) {
         (data.pageText || '').length + (data.description || '').length;
       if (
         !fallbackTried &&
+        needFallback &&
         localLen < LOCAL_TEXT_MIN &&
         res.status === 'ok' &&
         !res.skipped &&
         !force
       ) {
         fallbackTried = true;
-        const fb = await send({ type: 'analyze-url', url: location.href });
+        const fb = await send(
+          { type: 'analyze-url', url: location.href },
+          SEND_TIMEOUT_LOAD_MS
+        );
         if (fb && fb.status === 'ok' && (fb.textLength || 0) > (res.textLength || 0)) {
           res = fb;
         }
@@ -468,7 +759,10 @@ function hasMatches(r) {
       if (asgAwaitComposition(res)) {
         // результат по не-составу: показываем «проверяем состав…» и ждём
         // настоящий блок, финальным считать такой расчёт нельзя
-        rememberNote('ждём блок «Состав»: пока считаем по ' + (res.source || 'странице'));
+        rememberNote(
+          'ждём блок «Состав»: пока считаем по ' +
+            (ASG_SOURCE_LABEL[res.source] || 'тексту страницы')
+        );
         res = Object.assign({}, res, { complete: false, awaitingComposition: true });
       } else if (final) {
         lastFinal = true;
@@ -482,37 +776,134 @@ function hasMatches(r) {
       updateBadge(true);
     } finally {
       busy = false;
+      if (pendingAnalyze) {
+        const p = pendingAnalyze;
+        pendingAnalyze = null;
+        // через таймер, а не сразу: не растим стек при частых событиях
+        setTimeout(() => analyze(p.force, p.final), 0);
+      }
     }
   }
 
   // --- наблюдение за до-рендером и SPA-переходами ---
 
-  function stopWatch() {
+  function stopTimers() {
     if (pollTimer) {
       clearInterval(pollTimer);
       pollTimer = null;
     }
-    if (recheckTimer) {
-      clearTimeout(recheckTimer);
-      recheckTimer = null;
-    }
     watching = false;
+  }
+
+  function stopWatch() {
+    stopTimers();
     updateBadge(true);
   }
 
   function startWatch() {
-    if (pollTimer) clearInterval(pollTimer);
-    if (recheckTimer) clearTimeout(recheckTimer);
+    stopTimers();
     watchUntil = Date.now() + WATCH_MS;
     watching = true;
     lastGrowthAt = Date.now();
     pollTimer = setInterval(tick, POLL_MS);
+    startObserver();
   }
+
+  // Наблюдение за DOM вместо опроса текста: Ozon дорисовывает описание и блок
+  // «Состав» при прокрутке, иногда уже после вердикта. Прежний опрос
+  // прекращался вместе с окном наблюдения, и такой состав не замечался никогда;
+  // MutationObserver срабатывает ровно тогда, когда страница что-то дорисовала.
+  function startObserver() {
+    if (mutationObserver || !document.body) return;
+    mutationObserver = new MutationObserver((records) => {
+      // Перерисовку собственного значка изменением страницы не считаем
+      let ownOnly = true;
+      for (const rec of records) {
+        const nodes = [];
+        if (rec.addedNodes) for (const n of rec.addedNodes) nodes.push(n);
+        if (rec.removedNodes) for (const n of rec.removedNodes) nodes.push(n);
+        if (!nodes.length) {
+          ownOnly = false;
+          break;
+        }
+        for (const n of nodes) {
+          if (n.nodeType === 1 && n.hasAttribute && n.hasAttribute(BADGE_ATTR)) continue;
+          ownOnly = false;
+          break;
+        }
+        if (!ownOnly) break;
+      }
+      if (ownOnly) return;
+      bodyLenApply(records);
+      if (mutationTimer) return;
+      mutationTimer = setTimeout(() => {
+        mutationTimer = null;
+        onDomChanged();
+      }, MUTATION_DEBOUNCE_MS);
+    });
+    try {
+      mutationObserver.observe(document.body, { childList: true, subtree: true });
+    } catch (e) {
+      mutationObserver = null;
+    }
+  }
+
+  function stopObserver() {
+    if (mutationTimer) {
+      clearTimeout(mutationTimer);
+      mutationTimer = null;
+    }
+    if (mutationObserver) {
+      mutationObserver.disconnect();
+      mutationObserver = null;
+    }
+  }
+
+  // Страница что-то дорисовала. Реагируем не чаще, чем раз в REACT_MIN_MS.
+  function onDomChanged() {
+    if (!settings || !settings.enabled || !hostAllowed() || !isProductPage()) return;
+    if (location.href !== lastHref) {
+      start(); // SPA-переход на другой товар
+      return;
+    }
+    if (state && state.status === 'ok' && state.skipped) return;
+    const now = Date.now();
+    // Реагируем, пока страница ещё может дорисовать состав: окно наблюдения,
+    // а после вердикта — ещё LATE_WATCH_MS
+    if (now > lateWatchUntil) return;
+    if (now - lastReactAt < REACT_MIN_MS) return;
+    lastReactAt = now;
+
+    const len = bodyTextLen();
+    if (len > lastBodyLen) {
+      lastBodyLen = len;
+      lastGrowthAt = now;
+      // Достоверный вердикт по составу пересчитывать на каждый прирост текста
+      // незачем: дальше идут отзывы, рекомендации и прочая обвязка страницы.
+      const stable = !!(state && state.status === 'ok' && state.authoritative === true);
+      if (!stable) analyze(true, lastFinal);
+      return;
+    }
+
+    // Текст не вырос, но состав мог дорисоваться отдельным блоком — проверяем
+    // это, пока идёт позднее наблюдение
+    if (lastExtract && lastExtract.hasComposition) return;
+    if (now - lastAnalyzedAt < LATE_CHECK_MS) return;
+    if (!asgCompositionLabelPresent()) return;
+    if (!asgProbeCompositionReady(document, settings)) return;
+    rememberNote('блок «Состав» дорисован позже — пересчёт по нему');
+    analyze(true, true);
+  }
+
   function tick() {
     if (location.href !== lastHref) {
       start(); // SPA-переход на другой товар
       return;
     }
+    // Непищевой товар: состава тут не будет, ждать нечего. Держим только
+    // проверку адреса (переход на другой товар в SPA), чтобы не гонять
+    // извлечение и обход текста по странице одежды или электроники.
+    if (state && state.status === 'ok' && state.skipped) return;
     const now = Date.now();
     if (now > watchUntil) {
       // Блок «Состав» на Ozon появляется позже основного текста. Если после
@@ -521,15 +912,12 @@ function hasMatches(r) {
       // Поэтому ждём состав ещё COMPOSE_WAIT_MS и пересчитываем, как только он
       // появится. Проверка идёт раз в COMPOSE_PROBE_MS и только на тихой странице.
       if (composeWaitUntil > now && asgWeakComposition(lastExtract)) {
-        const len = bodyTextLen();
-        if (len > lastBodyLen) {
-          lastGrowthAt = now;
-          lastBodyLen = len;
-        }
         if (now - composeProbeAt >= COMPOSE_PROBE_MS && isSettled()) {
           composeProbeAt = now;
-          const fresh = asgExtractFromDoc(document, settings);
-          if (!asgWeakComposition(fresh)) {
+          // Спрашиваем только факт появления значения у подписи: полное
+          // извлечение здесь обошло бы ещё и описание, категорию и текст
+          // страницы, а это повторяется раз в секунду до двух десятков раз
+          if (asgProbeCompositionReady(document, settings)) {
             rememberNote('найден настоящий блок «Состав» — пересчёт по нему');
             analyze(true, true);
             stopWatch();
@@ -543,21 +931,9 @@ function hasMatches(r) {
       stopWatch();
       return;
     }
-    const len = bodyTextLen();
-    if (len > lastBodyLen) {
-      // текст ещё меняется (SPA догружает описание) — пересчитываем
-      lastGrowthAt = now;
-      lastBodyLen = len;
-      if (recheckTimer) clearTimeout(recheckTimer);
-      recheckTimer = setTimeout(() => {
-        recheckTimer = null;
-        analyze(true, false);
-      }, 400);
-      return;
-    }
-// текст устоялся: финализируем результат (тогда его можно показывать),
-// иначе просто перерисуем значок (например, сменился статус подтверждения)
-if (!lastFinal && isSettled()) {
+    // Прирост текста отслеживает MutationObserver (onDomChanged). Здесь только
+    // финализация: пока страница не устоялась, вердикт показывать рано.
+    if (!lastFinal && isSettled()) {
       analyze(true, true);
     } else {
       updateBadge();
@@ -567,12 +943,18 @@ if (!lastFinal && isSettled()) {
   function start() {
     lastHref = location.href;
     fallbackTried = false;
+    pendingAnalyze = null;
+    labelProbe = { at: 0, len: -1, present: false };
+    bodyLenExact();
     lastBodyLen = bodyTextLen();
     lastAnalyzedAt = Date.now();
     lastGrowthAt = Date.now();
     lastFinal = false;
+    confirmedShown = false; // новый товар — показываем заново
+    lastReactAt = 0;
     composeWaitUntil = Date.now() + WATCH_MS + COMPOSE_WAIT_MS;
     awaitUntil = Date.now() + AWAIT_COMPOSITION_MS;
+    lateWatchUntil = Date.now() + LATE_WATCH_MS;
     composeProbeAt = 0;
     state = { status: 'pending' };
     updateBadge(true);
@@ -601,7 +983,9 @@ function asgWeakComposition(e) {
   async function diagnose() {
     const s = settings || ASG_DEFAULTS;
     const reason = inactiveReason();
-    const fresh = reason ? null : asgExtractFromDoc(document, s);
+    // третий аргумент — «покажи полный текст страницы»: в отчёте он нужен
+    // независимо от того, подтвердился состав или нет
+    const fresh = reason ? null : asgExtractFromDoc(document, s, true);
     let cacheInfo = null;
     try {
       cacheInfo = await send({ type: 'cache-info' });
@@ -625,16 +1009,25 @@ function asgWeakComposition(e) {
       productPage: isProductPage(),
       reason: reason,
       topCategory: e.topCategory || null,
-      pageIsFood: e.topCategory ? isFoodCategory(e.topCategory) : null,
+      pageIsFood: e.topCategory ? categoryDecision(e.topCategory) : null,
+      // итоговое решение фона: 'food' по разделу или по составу, 'notFood',
+      // 'unknown' (раздел не опознан, но состав пищевой — так разбирают,
+      // например батончики в разделе «Спорт и отдых»)
+      foodDecision: (state && state.foodDecision) || null,
       extraction: {
         skipped: !!reason,
         hasComposition: !!e.hasComposition,
         hasDescriptionBlock: !!e.hasDescriptionBlock,
         confident: !!e.confident,
         authoritative: !!e.authoritative,
+        compositionTrusted: !!e.compositionTrusted,
+        materialComposition: !!e.materialComposition,
+        compositionBrackets: e.compositionBrackets || null,
         compositionTier: e.compositionTier || 0,
         compositionCandidates: e.compositionCandidates || 0,
         compositionCandidatesList: e.compositionCandidatesList || [],
+        // selector | label | attrs | chars | full | none — докуда дошёл поиск состава
+        compositionDeepScan: e.compositionDeepScan || 'none',
         compositionParts: e.compositionParts || 0,
         compositionWellFormed: !!e.compositionWellFormed,
         ingredientListLike: !!e.ingredientListLike,
@@ -648,12 +1041,14 @@ function asgWeakComposition(e) {
       result: state,
       resultConfirmed: isConfirmed(state),
       watching,
+      observer: !!mutationObserver,
       compositionProbe: probe,
       cache: cacheInfo,
       settingsUsed: {
         preferComposition: !!(settings && settings.preferComposition),
         markClean: settings && settings.markClean,
-        foodCategories: (settings && settings.foodCategories) || []
+        foodCategories: (settings && settings.foodCategories) || [],
+        nonFoodCategories: (settings && settings.nonFoodCategories) || []
       },
       errors,
       notes
@@ -688,12 +1083,34 @@ function asgWeakComposition(e) {
     return false;
   });
 
-  chrome.storage.onChanged.addListener(async (_changes, area) => {
+  // Ключи настроек, влияющие на вердикт. Служебный кэш фона (asgCache) пишется
+  // в то же хранилище и приходит сюда же: без этого фильтра каждое сохранение
+  // кэша запускало полный пересчёт страницы, а тот снова писал кэш — то есть
+  // бесконечный цикл «анализ → запись кэша → onChanged → анализ» каждую секунду.
+  const SETTINGS_KEYS = [
+    'enabled',
+    'markClean',
+    'preferComposition',
+    'foodCategories',
+    'nonFoodCategories',
+    'zones',
+    'excludes',
+    'contextExcludes',
+    'hosts',
+    'selectors',
+    'fetchStrategy',
+    'maxDescChars'
+  ];
+
+  chrome.storage.onChanged.addListener(async (changes, area) => {
     if (area !== 'local') return;
+    if (!SETTINGS_KEYS.some((k) => k in changes)) return;
     await loadSettings();
+    labelProbe = { at: 0, len: -1, present: false };
     if (!isProductPage()) return;
     if (!settings.enabled || !hostAllowed()) {
       stopWatch();
+      stopObserver();
       removeBadge();
       return;
     }

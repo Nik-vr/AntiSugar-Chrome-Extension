@@ -24,12 +24,23 @@ const ASG_NAV_NOISE =
 const ASG_COMPOSITION_LABEL =
   /^\s*(состав|состав\s+товара|состав\s+продукта|ингредиенты|ингредиент[ы]?(\s+и\s+состав)?|ingredients|composition)\s*[:—-]?\s*$/i;
 const ASG_DESCRIPTION_LABEL = /^\s*(описани[ея]|описание\s+товара|description)\s*[:—-]?\s*$/i;
+
+// Подпись непищевого состава: «Состав материала», «Состав ткани», а также
+// характеристики «Материал» и «Ткань». У одежды на Ozon подпись именно такая
+// («Состав материала 40% фибра, 23% спандекс, 20% шерсть, 17% акрил»), и
+// страница попадала в анализ как карточка продукта питания.
+const ASG_MATERIAL_LABEL =
+  /состав\s+(материал|ткан|издели|верха|подкладк)|^\s*(материал|материал\s+изделия|ткань)\s*[:—-]?\s*$/i;
 // Начало подписи «Состав» вместе со значением в том же элементе:
 // «Состав: концентрат сывороточного белка, …». Хвост не ограничен по длине.
 const ASG_COMPOSITION_PREFIX =
   /^\s*(?:состав|ингредиенты|ингредиент[ы]?|ingredients|composition)\s*[:—-]\s*/i;
 
 const ASG_MAX_COMPOSITION = 1500;
+// Минимальная длина текста, который вообще может быть составом. Граница общая
+// для извлекателя и для выбора источника в фоне (pickSource): если пороги
+// разойдутся, достоверный состав не попадёт в анализ.
+const ASG_MIN_COMPOSITION = 8;
 // Состав может быть длинным — ассорти с четырьмя вкусами легко переваливает за
 // полторы тысячи символов. Для значения, стоящего рядом с подписью «Состав»,
 // разрешаем больше; «далёкие» куски текста (весь контейнер характеристик,
@@ -89,17 +100,30 @@ function asgVisibleText(doc, limit) {
 // «Состав: сорбитол, аспартам, лимонная кислота» — это настоящий состав,
 // и раньше проба называла его заглушкой.
 const ASG_EMPTY_COMPOSITION =
-  /^(не указан|нет данных|нет\s|по запросу|см\.?\s|уточняйте|на упаковке|упаковке|изготовител|состав не|данные отсутствуют|информация|состав:\s*$|—|-|\.)/i;
+  /^(не указан|нет данных|нет\s|по запросу|см\.?\s|уточняйте|на упаковке|упаковке|изготовител|состав не|данные отсутствуют|информация|состав:\s*$)/i;
+
+// Значение целиком из пунктиров: «—», «-.», «— —».
+// Отдельное правило, а не часть ASG_EMPTY_COMPOSITION: перечень вкусов на Ozon
+// начинается с тире («- глазурь молочно-шоколадная…»), и раньше такое значение
+// отбрасывалось как заглушка «—», то есть настоящий состав терялся.
+const ASG_PUNCT_ONLY = /^[—–\-·•.\s]+$/;
 
 // Подпись «Состав» может быть приклеена к значению («Состав: уточняйте по
 // запросу»), поэтому заглушку ищем и по тексту без подписи.
 const ASG_LABEL_PREFIX = /^\s*состав\s*:\s*/i;
 
 function asgIsEmptyComposition(t) {
-  if (ASG_EMPTY_COMPOSITION.test(t)) return true;
+  if (ASG_EMPTY_COMPOSITION.test(t) || ASG_PUNCT_ONLY.test(t)) return true;
   const stripped = t.replace(ASG_LABEL_PREFIX, '');
-  return stripped !== t && ASG_EMPTY_COMPOSITION.test(stripped);
+  return stripped !== t && asgIsEmptyComposition(stripped);
 }
+
+// Хвост из рекламы и условий хранения, который Ozon ставит следом за перечнем
+// вкусов: «Условия хранения: … Участвуйте в акции магазина: скидка 20%».
+// Обрезаем его: одна рекламная строка отбрасывала весь перечень — и по причине
+// «похоже на рекламу». Ни одно из этих слов в составе ингредиентов не встречается.
+const ASG_PROMO_TAIL =
+  /(отзыв|рекоменд|услови\s+хранения|хранени|гарант|доставк|акци|скидк|промокод|купон|бонус|распродаж|участвуйте|отзывы)/i;
 
 // Начало с рекламной фразы «не содержит сахара и пальмового масла. Батончик…» —
 // это не заглушка, а настоящий состав, у которого первая фраза рекламная.
@@ -157,7 +181,7 @@ const ASG_NOT_COMPOSITION_HEAD =
 function asgCompositionScore(text, maxLen, lenient, allowSingle) {
   const t = asgCollapse(text);
   const cap = maxLen || ASG_MAX_COMPOSITION;
-  if (t.length < 8 || t.length > cap) return -1;
+  if (t.length < ASG_MIN_COMPOSITION || t.length > cap) return -1;
   if (!lenient && ASG_NOT_COMPOSITION.test(t)) return -1;
   if (ASG_NOT_COMPOSITION_HEAD.test(t)) return -1;
   if (asgIsEmptyComposition(t)) return -1;
@@ -191,9 +215,17 @@ function asgCompositionScore(text, maxLen, lenient, allowSingle) {
 // Почему текст не признан составом: имя правила или пустая строка.
 // Нужно для отчёта «Диагностика», чтобы не гадать, какая проверка сработала.
 function asgCompositionReject(text, maxLen) {
-  const t = asgCollapse(text);
+  // Те же хвосты, что отрезает add(): иначе диагностика объясняет отказ по
+  // тексту, который в анализ уже не попадал
+  let raw = String(text || '');
+  let collapsed = asgCollapse(raw);
+  const nut = asgNutritionTail.exec(collapsed);
+  if (nut && nut.index > 20) collapsed = asgCollapse(collapsed.slice(0, nut.index));
+  const promo = ASG_PROMO_TAIL.exec(collapsed);
+  if (promo && promo.index > 20) collapsed = asgCollapse(collapsed.slice(0, promo.index));
+  const t = collapsed;
   const cap = maxLen || ASG_MAX_COMPOSITION;
-  if (t.length < 8) return 'слишком короткий';
+  if (t.length < ASG_MIN_COMPOSITION) return 'слишком короткий';
   if (t.length > cap) return 'длиннее ' + cap + ' символов';
   if (ASG_NOT_COMPOSITION.test(t)) {
     const m = /(отзыв|рейтинг|доставк|гарант|₽|руб|скидк|акци|бонус|пункт выдачи|купить|в корзин|посмотреть|сравнить|ваша корзин|рассрочк|баллы|рекомендов)/i.exec(t);
@@ -207,16 +239,40 @@ function asgCompositionReject(text, maxLen) {
   return s > 0 ? '' : 'не похоже на перечень';
 }
 
-// Похож ли состав на завершённый: скобки сбалансированы, нет обрыва на
-// запятой/союзе. Обрезанный состав (например «…глазурь (сахар») нельзя
+// Скобки в составе: сколько открывающих, закрывающих и какова глубина
+// вложенности в конце текста. Глубина > 0 означает, что текст обрывается внутри
+// незакрытой группы.
+function asgCompositionBrackets(text) {
+  const t = asgCollapse(text);
+  let open = 0;
+  let close = 0;
+  let depth = 0;
+  for (let i = 0; i < t.length; i++) {
+    const ch = t[i];
+    if (ch === '(' || ch === '«' || ch === '[') {
+      open++;
+      depth++;
+    } else if (ch === ')' || ch === '»' || ch === ']') {
+      close++;
+      if (depth > 0) depth--;
+    }
+  }
+  return { open, close, depth };
+}
+
+// Похож ли состав на завершённый: нет обрыва на запятой/союзе и внутри
+// незакрытой скобки. Обрезанный состав (например «…глазурь (сахар») нельзя
 // считать достоверным: в нём обрезаны и слова, и их окончания.
+// Считаем именно глубину вложенности, а не равенство числа скобок: лишняя
+// закрывающая скобка или опечатка в середине длинного состава обрывом не
+// является. Раньше равенство требовалось строго, и из-за одной такой скобки
+// терялся вердикт по полному составу: блок «Состав» найден, 32 компонента,
+// опасные вещества перечислены, а флаг показывал «Состав не подтверждён».
 function asgCompositionWellFormed(text) {
   const t = asgCollapse(text);
   // короткий состав из одного компонента («пюре яблочное») — завершённый
-  if (t.length < 8) return false;
-  const open = (t.match(/[(«\[]/g) || []).length;
-  const close = (t.match(/[)\]»]/g) || []).length;
-  if (open !== close) return false;
+  if (t.length < ASG_MIN_COMPOSITION) return false;
+  if (asgCompositionBrackets(t).depth > 0) return false;
   if (/[,;:]$/.test(t)) return false;
   // \b в JS не работает с кириллицей, поэтому границу задаём пробелом
   if (/(?:\s|^)(и|или|а|но|из|с|по|для|без|при|от)\s*$/i.test(t)) return false;
@@ -239,6 +295,16 @@ function asgTrustedComposition(tier) {
     tier === ASG_TIER_CONTAINER ||
     tier === ASG_TIER_JSON
   );
+}
+
+// Группы надёжности для сравнения кандидатов. Внутри группы форма значения
+// важнее номера источника, между группами — наоборот: значение рядом с подписью
+// «Состав» не должно проигрывать перечню, собранному сканом всей страницы.
+function asgTierGroup(tier) {
+  if (tier <= ASG_TIER_SAME) return 1; // значение вплотную к подписи
+  if (tier <= ASG_TIER_PARENT_SIBLING) return 2; // рядом с подписью
+  if (tier <= ASG_TIER_JSON) return 3; // атрибуты, контейнер, состояние страницы
+  return 4; // текстовый скан всей страницы
 }
 
 function asgIngredientListLike(text) {
@@ -297,6 +363,63 @@ function asgLabeledValues(el, labelText, maxLen) {
   return out;
 }
 
+// Элементы, в которых вообще может стоять подпись «Состав».
+// Один список на поиск кандидатов и на быструю проверку подписи, чтобы
+// правила не разъезжались.
+const ASG_LABEL_ELEMENT_SEL =
+  'b, strong, span, div, h1, h2, h3, h4, h5, h6, dt, dd, label, p, li, summary, td, th';
+
+// Максимум дочерних элементов у узла, который ещё может быть подписью со
+// значением («Состав: сорбитол, …»). Крупный контейнер перечнем быть не может,
+// а обход его textContent — самая дорогая операция на тяжёлой странице.
+const ASG_MAX_LABEL_CHILDREN = 40;
+
+// Текст элемента, если он заведомо небольшой. Возвращает null для крупных
+// контейнеров: у них не бывает склеенной подписи и значения, а полный обход
+// поддерева (textContent) для сотен вложенных div — это лишние мегабайты
+// строк и регулярных выражений на каждом извлечении.
+function asgElementText(el) {
+  if (!el) return null;
+  if (el.childElementCount > ASG_MAX_LABEL_CHILDREN) return null;
+  const first = el.firstChild;
+  if (first && first.nodeType === 3 && !first.nextSibling) {
+    // один текстовый узел — самый частый случай, поддерево не обходим
+    return first.nodeValue || '';
+  }
+  return el.textContent;
+}
+
+// Один проход по подписям: есть ли на странице пищевой «Состав» и есть ли
+// «Состав материала» (одежда, текстиль). Результат нужен, чтобы решить, ждать
+// ли появления состава, и чтобы не оценивать непищевой товар.
+// Подпись считается пищевой только строгой проверкой (ASG_COMPOSITION_LABEL):
+// в 1.5.0 здесь стояло /^состав/i, и «Состав материала» принимался за состав
+// продукта — расширение ждало появления еды на странице перчаток.
+function asgScanCompositionLabels(doc) {
+  const out = { composition: false, material: false };
+  try {
+    for (const el of doc.querySelectorAll(ASG_LABEL_ELEMENT_SEL)) {
+      const raw = asgElementText(el);
+      if (raw === null) continue;
+      const t = asgCollapse(raw);
+      if (!t || t.length > 400) continue;
+      const looksLikeComposition = /^состав|^ингредиент|^ingredients|^composition/i.test(t);
+      const looksLikeMaterial = ASG_MATERIAL_LABEL.test(t);
+      if (!looksLikeComposition && !looksLikeMaterial) continue;
+      if (looksLikeMaterial) out.material = true;
+      if (looksLikeComposition && ASG_COMPOSITION_LABEL.test(t)) out.composition = true;
+      if (out.composition && out.material) break;
+    }
+  } catch (e) { /* ignore */ }
+  return out;
+}
+
+// Есть ли на странице подпись пищевого состава (без диагностики: результат
+// нужен каждый раз, когда решается, ждать ли появления блока).
+function asgHasCompositionLabel(doc) {
+  return asgScanCompositionLabels(doc).composition;
+}
+
 // Все кандидаты значения для метки (таблицы + элементы) с их надёжностью
 function asgLabeledCandidates(doc, labelRe, maxLen) {
   const max = maxLen || ASG_MAX_COMPOSITION;
@@ -336,11 +459,11 @@ function asgLabeledCandidates(doc, labelRe, maxLen) {
 
   // обычные элементы-метки
   try {
-    const els = doc.querySelectorAll(
-      'b, strong, span, div, h1, h2, h3, h4, h5, h6, dt, dd, label, p, li, summary, td'
-    );
+    const els = doc.querySelectorAll(ASG_LABEL_ELEMENT_SEL);
     for (const el of els) {
-      const t = asgCollapse(el.textContent);
+      const raw = asgElementText(el);
+      if (raw === null) continue; // крупный контейнер: подписи со значением тут нет
+      const t = asgCollapse(raw);
       if (!t) continue;
       // «Состав: <значение>» в одном элементе. Раньше такой элемент отбрасывался
       // по длине (значение состава всегда длиннее 120 символов) и строгой
@@ -361,6 +484,30 @@ function asgLabeledCandidates(doc, labelRe, maxLen) {
 // Верхняя категория товара по хлебным крошкам.
 // Возвращает { name, reliable }: reliable=true — крошки найдены однозначно,
 // reliable=false — предположительно (использовать только как подсказку).
+//
+// Результат запоминаем на документ: обход всех ссылок страницы стоит
+// десятки миллисекунд, а извлечение повторяется на каждой пачке изменений DOM.
+// Ключ — адрес страницы, поэтому переход SPA на другой товар пересчитывает
+// категорию заново.
+const asgTopCategoryMemo = new WeakMap();
+
+function asgTopCategoryMemoKey(doc) {
+  try {
+    return (doc.location && doc.location.href) || '';
+  } catch (e) {
+    return '';
+  }
+}
+
+function asgTopCategoryCached(doc) {
+  const key = asgTopCategoryMemoKey(doc);
+  const hit = asgTopCategoryMemo.get(doc);
+  if (hit && hit.key === key) return hit.value;
+  const value = asgTopCategory(doc);
+  asgTopCategoryMemo.set(doc, { key, value });
+  return value;
+}
+
 function asgTopCategory(doc) {
   const skip = new Set(['главная', 'home', 'каталог', '']);
 
@@ -390,7 +537,29 @@ function asgTopCategory(doc) {
     if (top) return { name: top, reliable: true };
   }
 
-  // 2) контейнер крошек: список или элемент с маркером «breadcrumb»
+  // 2) контейнер крошек по маркеру разметки: берём первую осмысленную ссылку
+  // независимо от того, называется она «Главная» или нет.
+  // У Ozon первая крошка — «Ozon», поэтому поиск от «Главной» (шаг 3) на
+  // карточках Ozon не находил ничего: верхняя категория оставалась неизвестной,
+  // и одежда с косметикой попадали в анализ как продукты питания.
+  const crumbBoxes = doc.querySelectorAll(
+    '[data-widget*="breadcrumb" i], [data-widget*="breadcrumbs" i],' +
+    ' [aria-label*="breadcrumb" i], [aria-label*="хлеб" i],' +
+    ' [class*="breadcrumb" i], [class*="crumb" i], [class*="хлеб" i]'
+  );
+  for (const box of crumbBoxes) {
+    const links = Array.from(box.querySelectorAll('a[href]'));
+    if (links.length < 2 || links.length > 12) continue;
+    for (const l of links) {
+      const t = asgCollapse(l.textContent).toLowerCase();
+      if (!t || t.length > 60) continue;
+      if (skip.has(t) || t === 'ozon' || t === 'озон' || t === 'market') continue;
+      if (ASG_NAV_NOISE.test(t)) continue;
+      return { name: t, reliable: true };
+    }
+  }
+
+  // 3) контейнер крошек: список или элемент с маркером «breadcrumb»
   const anchors = doc.querySelectorAll('a[href]');
   for (const a of anchors) {
     const t = asgCollapse(a.textContent).toLowerCase();
@@ -499,12 +668,6 @@ function asgScriptTexts(doc) {
 // Состав из JSON-состояния страницы. Формы:
 // {"Состав":"..."}, {"Состав":["...",...]}, {"title":"Состав","value":"..."}
 function asgCompositionFromSources(doc) {
-  const pools = [];
-  try {
-    pools.push((doc.documentElement && doc.documentElement.innerHTML) || '');
-  } catch (e) { /* ignore */ }
-  for (const t of asgScriptTexts(doc)) pools.push(t);
-
   const patterns = [
     /"(?:состав|composition|ingredients?)"\s*:\s*"((?:[^"\\]|\\.){8,800})"/i,
     /"(?:состав|composition|ingredients?)"\s*:\s*\[((?:[^[\]]){8,800})\]/i,
@@ -513,8 +676,8 @@ function asgCompositionFromSources(doc) {
     /"(?:состав|composition|ingredients?)"[\s\S]{0,300}?"(?:value|текст|описание|description)"\s*:\s*\[((?:[^[\]]){8,800})\]/i
   ];
 
-  for (const pool of pools) {
-    if (!pool) continue;
+  const scan = (pool) => {
+    if (!pool) return null;
     for (const re of patterns) {
       const m = re.exec(pool);
       if (!m) continue;
@@ -527,6 +690,24 @@ function asgCompositionFromSources(doc) {
       // одиночный компонент («пюре яблочное») здесь допустим
       if (asgCompositionScore(v, ASG_MAX_COMPOSITION, true, true) > 0) return v;
     }
+    return null;
+  };
+
+  // 1) Разметка целиком: состояние страницы лежит и в inline-скриптах, и в
+  //    data-атрибутах, поэтому innerHTML — самый полный источник.
+  let html = '';
+  try {
+    html = (doc.documentElement && doc.documentElement.innerHTML) || '';
+  } catch (e) { /* ignore */ }
+  const fromHtml = scan(html);
+  if (fromHtml) return fromHtml;
+
+  // 2) Только если разметка не дала результата — раскодируем \uXXXX в скриптах.
+  //    Это дорого (до 400 КБ на скрипт), а содержимое inline-скриптов уже было
+  //    в разметке: считаем второй раз только ради раскодированной кириллицы.
+  for (const t of asgScriptTexts(doc)) {
+    const v = scan(t);
+    if (v) return v;
   }
   return null;
 }
@@ -557,7 +738,10 @@ function asgProductTitles(doc) {
   try {
     const h1 = doc.querySelector('h1');
     if (h1) add(h1.textContent);
-    add((doc.documentElement && doc.documentElement.title) || '');
+    // Заголовок документа — это doc.title (содержимое <title>).
+    // documentElement.title — атрибут title у <html>, он почти всегда пустой,
+    // из-за чего название страницы в сравнении не участвовало.
+    add(doc.title || '');
   } catch (e) { /* ignore */ }
   return out;
 }
@@ -582,8 +766,12 @@ function asgLooksLikeTitle(titles, text) {
   return /\s[-–—]\s/.test(raw) || caps >= 2;
 }
 
-function asgFindComposition(doc, selectors) {
+// opts.skipDeep — не выполнять самые дорогие шаги (состояние страницы и скан
+// всего текста). Они дают только слабые источники (tier 8 и 9), поэтому
+// дешёвая проверка «появился ли настоящий блок «Состав»» их пропускает.
+function asgFindComposition(doc, selectors, opts) {
   const cands = [];
+  const skipDeep = !!(opts && opts.skipDeep);
   const titles = asgProductTitles(doc);
   // одиночный компонент отличаем от названия товара по заголовку страницы;
   // если заголовка нет, отличить нечем — и одиночную фразу не берём
@@ -599,12 +787,26 @@ function asgFindComposition(doc, selectors) {
     // а не состав: у сахарной халвы там «общего сахара 2 г», и это не сахар
     const nut = asgNutritionTail.exec(t);
     if (nut && nut.index > 20) t = asgCollapse(t.slice(0, nut.index));
+    // хвост с рекламой и условиями хранения — отрезаем по той же причине
+    const promo = ASG_PROMO_TAIL.exec(t);
+    if (promo && promo.index > 20) t = asgCollapse(t.slice(0, promo.index));
     const listLike = asgIngredientListLike(t);
     // одиночная фраза вместо состава, если она совпадает с названием товара
     if (!listLike && asgLooksLikeTitle(titles, t)) return;
     const parts = asgCompositionScore(t, cap, direct, direct && mayBeSingle);
     if (parts > 0) cands.push({ text: t, tier, parts, listLike: listLike });
   };
+
+  // Кандидат, которого не может улучшить ни один следующий шаг: доверенный
+  // источник, перечень и завершённость. Порядок сортировки ниже сравнивает
+  // сначала надёжность источника, поэтому такой кандидат уже победитель —
+  // а значит самые дорогие шаги (состояние страницы и текстовый скан всей
+  // страницы) можно не выполнять. На тяжёлой карточке это экономит полную
+  // сериализацию DOM и раскодирование всех inline-скриптов.
+  const strongCandidate = () =>
+    cands.some(
+      (c) => asgTrustedComposition(c.tier) && c.listLike && asgCompositionWellFormed(c.text)
+    );
 
   // 1) селекторы из настроек
   for (const sel of selectors || []) {
@@ -614,65 +816,108 @@ function asgFindComposition(doc, selectors) {
     } catch (e) { /* некорректный селектор */ }
   }
 
-  // 2) элементы, у которых метка зашита в атрибуты
-  try {
-    const marked = doc.querySelectorAll(
-      '[data-test*="состав" i], [data-test*="composition" i], [data-test*="ingredient" i],' +
-      ' [data-widget*="состав" i], [class*="состав" i], [class*="composition" i],' +
-      ' [id*="состав" i], [aria-label*="состав" i]'
-    );
-    for (const el of marked) {
-      if (ASG_SKIP_TAGS.has(el.tagName)) continue;
-      add(el.textContent, ASG_TIER_ATTRIBUTE);
+// Что выполнили из дорогих шагов — видно в диагностике
+  let deepScan = 'selector';
+  if (!strongCandidate()) {
+    deepScan = 'label';
+
+    // 2) кандидаты по подписи «Состав». Шаг точный и недорогой, поэтому идёт
+    //    первым: если он уже нашёл доверительный перечень, следующие два шага
+    //    (поиск по атрибутам и обход контейнеров характеристик) можно не
+    //    выполнять — они дают только более слабые источники (tier 6 и 7),
+    //    а на тяжёлой карточке стоят дороже всех остальных шагов вместе.
+    for (const c of asgLabeledCandidates(doc, ASG_COMPOSITION_LABEL, ASG_MAX_COMPOSITION)) {
+      add(c.text, c.tier);
     }
-  } catch (e) { /* ignore */ }
 
-  // 3) кандидаты по подписи «Состав»
-  for (const c of asgLabeledCandidates(doc, ASG_COMPOSITION_LABEL, ASG_MAX_COMPOSITION)) {
-    add(c.text, c.tier);
-  }
+    if (!strongCandidate()) {
+      deepScan = 'attrs';
 
-  // 4) внутри контейнеров характеристик
-  try {
-    const containers = doc.querySelectorAll(ASG_CHAR_CONTAINER_SEL);
-    for (const cont of containers) {
-      const els = cont.querySelectorAll('span, div, dt, dd, td, th, p, b, strong, li, label');
-      for (const el of els) {
-        const t = asgCollapse(el.textContent);
-        if (!t || t.length > 60) continue;
-        if (!/^состав\s*[:—-]?\s*$/i.test(t)) continue;
-        for (const cand of asgLabeledValues(el, t, ASG_MAX_COMPOSITION)) {
-          add(cand.text, Math.min(cand.tier, ASG_TIER_CONTAINER));
+      // 3) элементы, у которых метка зашита в атрибуты
+      try {
+        const marked = doc.querySelectorAll(
+          '[data-test*="состав" i], [data-test*="composition" i], [data-test*="ingredient" i],' +
+            ' [data-widget*="состав" i], [class*="состав" i], [class*="composition" i],' +
+            ' [id*="состав" i], [aria-label*="состав" i]'
+        );
+        for (const el of marked) {
+          if (ASG_SKIP_TAGS.has(el.tagName)) continue;
+          add(el.textContent, ASG_TIER_ATTRIBUTE);
+        }
+      } catch (e) { /* ignore */ }
+
+      if (!strongCandidate()) {
+        deepScan = 'chars';
+
+        // 4) внутри контейнеров характеристик
+        try {
+          const containers = doc.querySelectorAll(ASG_CHAR_CONTAINER_SEL);
+          // Вложенные контейнеры дают те же элементы: без этого один и тот же
+          // узел обрабатывался столько раз, на сколько контейнеров он попадает
+          const seen = new WeakSet();
+          for (const cont of containers) {
+            const els = cont.querySelectorAll(
+              'span, div, dt, dd, td, th, p, b, strong, li, label'
+            );
+            for (const el of els) {
+              if (seen.has(el)) continue;
+              seen.add(el);
+              const raw = asgElementText(el);
+              if (raw === null) continue;
+              const t = asgCollapse(raw);
+              if (!t || t.length > 60) continue;
+              if (!/^состав\s*[:—-]?\s*$/i.test(t)) continue;
+              for (const cand of asgLabeledValues(el, t, ASG_MAX_COMPOSITION)) {
+                add(cand.text, Math.min(cand.tier, ASG_TIER_CONTAINER));
+              }
+            }
+          }
+        } catch (e) { /* ignore */ }
+
+        if (!strongCandidate() && !skipDeep) {
+          deepScan = 'full';
+
+          // 5) JSON-состояние страницы
+          const fromJson = asgCompositionFromSources(doc);
+          if (fromJson) add(fromJson, ASG_TIER_JSON);
+
+          // 6) текстовый скан всей страницы
+          // Только с двоеточием: «Состав: …». Без двоеточия слово «состав» почти
+          // всегда встречается в обычном тексте («по составу есть три источника
+          // белка…»), и такой обрывок маркетинга раньше становился «составом».
+          try {
+            const text = asgVisibleText(doc, 80000);
+            const m = /состав\s*:\s*([\s\S]{8,1500})/i.exec(text);
+            if (m) {
+              let v = asgCollapse(m[1]);
+              const b = ASG_SECTION_BOUNDARY.exec(v);
+              if (b && b.index > 20) v = asgCollapse(v.slice(0, b.index));
+              add(v, ASG_TIER_TEXT);
+            }
+          } catch (e) { /* ignore */ }
         }
       }
     }
-  } catch (e) { /* ignore */ }
-
-  // 5) JSON-состояние страницы
-  const fromJson = asgCompositionFromSources(doc);
-  if (fromJson) add(fromJson, ASG_TIER_JSON);
-
-  // 6) текстовый скан всей страницы
-  // Только с двоеточием: «Состав: …». Без двоеточия слово «состав» почти всегда
-  // встречается в обычном тексте («по составу есть три источника белка…»), и
-  // такой обрывок маркетинга раньше становился «составом».
-  try {
-    const text = asgVisibleText(doc, 80000);
-    const m = /состав\s*:\s*([\s\S]{8,1500})/i.exec(text);
-    if (m) {
-      let v = asgCollapse(m[1]);
-      const b = ASG_SECTION_BOUNDARY.exec(v);
-      if (b && b.index > 20) v = asgCollapse(v.slice(0, b.index));
-      add(v, ASG_TIER_TEXT);
-    }
-  } catch (e) { /* ignore */ }
+  }
 
   if (!cands.length) return null;
-  // 1) перечень лучше одиночного компонента: у гранулы рядом с подписью стояло
-  //    название товара, а настоящий состав нашёлся дальше по тексту;
-  // 2) завершённость (обрезанный состав не берём, если есть целый);
-  // 3) надёжность источника; 4) компактность; 5) число компонентов
+  // 1) доверие источнику — безусловно: значение, найденное по подписи «Состав»,
+  //    не может проиграть обрывку, собранному сканом текста всей страницы,
+  //    даже если тот выглядит перечнем (иначе одно-компонентный состав
+  //    «пюре яблочное» на пастиле уходил в серый «не подтверждён»);
+  // 2) внутри группы надёжности — форма значения: селектор из настроек не
+  //    должен проигрывать [class*="spec"], но и одиночная фраза рядом с
+  //    подписью не должна вытеснять перечень из того же блока;
+  // 3) перечень лучше одиночного компонента;
+  // 4) завершённость (обрезанный состав не берём, если есть целый);
+  // 5) номер источника; 6) компактность; 7) число компонентов
   cands.sort((a, b) => {
+    const trustedA = asgTrustedComposition(a.tier) ? 1 : 0;
+    const trustedB = asgTrustedComposition(b.tier) ? 1 : 0;
+    if (trustedA !== trustedB) return trustedB - trustedA;
+    const ga = asgTierGroup(a.tier);
+    const gb = asgTierGroup(b.tier);
+    if (ga !== gb) return ga - gb;
     if (a.listLike !== b.listLike) return a.listLike ? -1 : 1;
     const wa = asgCompositionWellFormed(a.text) ? 0 : 1;
     const wb = asgCompositionWellFormed(b.text) ? 0 : 1;
@@ -688,6 +933,7 @@ function asgFindComposition(doc, selectors) {
     text: best.text,
     tier: best.tier,
     candidates: cands.length,
+    deepScan,
     // список кандидатов для диагностики: что вообще рассматривалось и почему
     // выбран именно этот — снимает гадание по отчёту
     list: cands.slice(0, 8).map((c) => ({
@@ -696,6 +942,22 @@ function asgFindComposition(doc, selectors) {
       head: c.text.slice(0, 70)
     }))
   };
+}
+
+// Дешёвая проверка «появился ли блок «Состав» с настоящим значением».
+// Пока страница дорисовывается, это спрашивается раз в секунду: полное
+// извлечение обходило бы ещё и описание, категорию и текст страницы, а здесь
+// нужен только факт появления значения рядом с подписью.
+function asgProbeCompositionReady(doc, settings) {
+  try {
+    const sel = (settings && settings.selectors && settings.selectors.composition) || [];
+    const comp = asgFindComposition(doc, sel, { skipDeep: true });
+    if (!comp) return false;
+    // слабые источники — те же, что и в asgWeakComposition у content script
+    return comp.tier !== ASG_TIER_PARENT_SIBLING && comp.tier !== ASG_TIER_TEXT;
+  } catch (e) {
+    return false;
+  }
 }
 
 // Блок «Описание»: селекторы из настроек + подпись «Описание».
@@ -732,11 +994,13 @@ function asgFindDescriptionBlock(doc, selectors) {
   return parts.length ? asgCollapse(parts.join(' ')) : null;
 }
 
-// Описание для анализа: найденные блоки + JSON-LD + метатеги + заголовник
-function asgFindDescription(doc, selectors) {
+// Описание для анализа: найденные блоки + JSON-LD + метатеги + заголовник.
+// block — уже найденный блок «Описание»: asgExtractFromDoc вызывает эту функцию
+// вместе с asgFindDescriptionBlock, и второй раз искать его незачем.
+function asgFindDescription(doc, selectors, block) {
   const parts = [];
-  const block = asgFindDescriptionBlock(doc, selectors);
-  if (block) parts.push(block);
+  const found = block !== undefined ? block : asgFindDescriptionBlock(doc, selectors);
+  if (found) parts.push(found);
   for (const t of asgJsonLdTexts(doc)) parts.push(t);
   ['meta[name="description"]', 'meta[property="og:description"]'].forEach((sel) => {
     const el = doc.querySelector(sel);
@@ -775,11 +1039,11 @@ function asgProbeComposition(doc) {
   try {
     // одиночный компонент отличаем от названия по заголовку страницы
     const mayBeSingle = asgProductTitles(doc).length > 0;
-    const els = doc.querySelectorAll(
-      'div, span, p, b, strong, dt, dd, td, th, li, label, h1, h2, h3, h4, h5, h6, summary'
-    );
+    const els = doc.querySelectorAll(ASG_LABEL_ELEMENT_SEL);
     for (const el of els) {
-      const t = asgCollapse(el.textContent);
+      const raw = asgElementText(el);
+      if (raw === null) continue;
+      const t = asgCollapse(raw);
       if (!t || t.length > 400) continue;
       if (!/^состав/i.test(t)) continue;
       const next = el.nextElementSibling;
@@ -811,16 +1075,25 @@ function asgProbeComposition(doc) {
   return out;
 }
 
-// Итоговая выжимка со страницы товара
-function asgExtractFromDoc(doc, settings) {
+// Итоговая выжимка со страницы товара.
+// wantPageText: полный текст страницы нужен только там, где фон может взять
+// его источником (состав не подтвердился) и в диагностике. Обход всех текстовых
+// узлов на тяжёлой карточке — самая дорогая часть извлечения, а при
+// подтверждённом составе он всё равно не используется.
+function asgExtractFromDoc(doc, settings, wantPageText) {
   const max = (settings && settings.maxDescChars) || 20000;
   const out = {
     composition: null,
     description: null,
     descriptionBlock: null,
+    // какие шаги поиска состава выполнялись (см. asgFindComposition):
+    // selector | label | attrs | chars | full | none — видно в диагностике
+    compositionDeepScan: 'none',
     hasComposition: false,
     hasDescriptionBlock: false,
     confident: false,
+    // «Состав материала» на странице: одежда, текстиль — не продукт питания
+    materialComposition: false,
     // Зелёный флаг («опасных веществ нет») доказуем только блоком «Состав».
     // Описание товара — маркетинговый текст: оно может не содержать состава
     // вообще, поэтому безопасность по нему утверждать нельзя.
@@ -836,7 +1109,7 @@ function asgExtractFromDoc(doc, settings) {
     (settings && settings.selectors && settings.selectors.description) || [];
 
   try {
-    const cat = asgTopCategory(doc);
+    const cat = asgTopCategoryCached(doc);
     out.topCategory = cat.name;
     out.topCategoryReliable = cat.reliable;
   } catch (e) {
@@ -849,27 +1122,47 @@ function asgExtractFromDoc(doc, settings) {
       out.compositionTier = comp.tier;
       out.compositionCandidates = comp.candidates;
       out.compositionCandidatesList = comp.list || [];
+      out.compositionDeepScan = comp.deepScan || 'full';
     } else {
       out.composition = null;
       out.compositionTier = 0;
       out.compositionCandidates = 0;
       out.compositionCandidatesList = [];
+      out.compositionDeepScan = 'none';
     }
   } catch (e) { /* ignore */ }
+  // Блок описания ищется один раз: asgFindDescription берёт его же, а считать
+  // дважды — значит платить за полный обход подписей дважды.
   try {
     out.descriptionBlock = asgFindDescriptionBlock(doc, descSelectors);
-    out.description = asgFindDescription(doc, descSelectors);
+    out.description = asgFindDescription(doc, descSelectors, out.descriptionBlock);
   } catch (e) { /* ignore */ }
-  try { out.pageText = asgVisibleText(doc, max); } catch (e) { /* ignore */ }
 
   out.hasComposition = !!out.composition;
   out.hasDescriptionBlock = !!out.descriptionBlock;
   out.confident = out.hasComposition || out.hasDescriptionBlock;
+  // Непищевой товар: ищем подпись «Состав материала» только когда пищевого
+  // состава нет — на остальных страницах признак не нужен, а обход подписей
+  // стоит времени.
+  if (!out.hasComposition) {
+    try {
+      out.materialComposition = asgScanCompositionLabels(doc).material;
+    } catch (e) { /* ignore */ }
+  }
   out.compositionParts = out.composition
     ? out.composition.split(/[,;]/).map((s) => s.trim()).filter(Boolean).length
     : 0;
   out.compositionWellFormed = asgCompositionWellFormed(out.composition || '');
   out.ingredientListLike = asgIngredientListLike(out.composition || '');
+  // Источник — настоящий блок «Состава» (подпись, селектор, контейнер,
+  // состояние страницы), даже если перечень не прошёл проверку завершённости.
+  // Нужен, чтобы предупреждение (красный/оранжевый/жёлтый) можно было показать
+  // и по неполному перечню: найденное вещество действительно в составе.
+  out.compositionTrusted = out.hasComposition && asgTrustedComposition(out.compositionTier);
+  // Скобки — для диагностики: по ним видно, почему перечень признан обрезанным
+  out.compositionBrackets = out.hasComposition
+    ? asgCompositionBrackets(out.composition)
+    : null;
   // Состав из одного компонента («пюре яблочное») тоже достоверен, если стоит
   // рядом с подписью «Состав» и не повторяет название товара.
   out.singleComponent =
@@ -886,5 +1179,12 @@ function asgExtractFromDoc(doc, settings) {
     asgTrustedComposition(out.compositionTier) &&
     out.compositionWellFormed &&
     (out.ingredientListLike || (out.singleComponent && !out.compositionIsTitle));
+  // Полный текст страницы собираем, только если он может стать источником
+  // (состав не подтвердился) или явно запрошен — так идёт диагностика.
+  if (wantPageText === true || !out.authoritative) {
+    try {
+      out.pageText = asgVisibleText(doc, max);
+    } catch (e) { /* ignore */ }
+  }
   return out;
 }

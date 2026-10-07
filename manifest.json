@@ -1,9 +1,10 @@
 {
   "manifest_version": 3,
   "name": "АнтиСахар — оценка товара",
-  "version": "1.4.23",
+  "version": "1.5.7",
   "description": "Показывает значок с оценкой безопасности товара на странице товара: анализ состава по зонам риска сахарозаменителей.",
-  "permissions": ["storage", "scripting"],
+  "minimum_chrome_version": "100",
+  "permissions": ["storage", "scripting", "unlimitedStorage"],
   "host_permissions": ["http://*/*", "https://*/*"],
   "background": {
     "service_worker": "background.js"

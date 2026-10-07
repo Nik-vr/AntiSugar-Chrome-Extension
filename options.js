@@ -10,7 +10,7 @@ const els = {};
 document.addEventListener('DOMContentLoaded', async () => {
   for (const id of [
     'enabled', 'markClean', 'preferComposition', 'fetchStrategy',
-    'foodCategories',
+    'foodCategories', 'nonFoodCategories',
     'zone-red', 'zone-orange', 'zone-yellow', 'zone-green',
     'excludes', 'contextExcludes', 'hosts', 'sel-comp', 'sel-desc',
     'save', 'reset', 'save-msg',
@@ -25,6 +25,9 @@ document.addEventListener('DOMContentLoaded', async () => {
   els.save.onclick = save;
   els.reset.onclick = async () => {
     await chrome.storage.local.set(ASG_DEFAULTS);
+    // Кэш вердиктов посчитан по прежним критериям: сбрасываем его вместе
+    // с настройками, иначе старые оценки останутся в силе
+    await chrome.runtime.sendMessage({ type: 'clear-cache' }).catch(() => null);
     fillFrom(ASG_DEFAULTS);
     flash('Сброшено (кэш очищен)');
     showCacheInfo();
@@ -49,6 +52,7 @@ function fillFrom(s) {
   els.preferComposition.checked = s.preferComposition !== false;
   els.fetchStrategy.value = s.fetchStrategy || 'auto';
   els.foodCategories.value = (s.foodCategories || []).join('\n');
+  els.nonFoodCategories.value = (s.nonFoodCategories || []).join('\n');
   const z = s.zones || {};
   els['zone-red'].value = (z.red || []).join('\n');
   els['zone-orange'].value = (z.orange || []).join('\n');
@@ -69,6 +73,7 @@ function collect() {
     preferComposition: els.preferComposition.checked,
     fetchStrategy: els.fetchStrategy.value,
     foodCategories: splitLines(els.foodCategories.value),
+    nonFoodCategories: splitLines(els.nonFoodCategories.value),
     zones: {
       red: splitLines(els['zone-red'].value),
       orange: splitLines(els['zone-orange'].value),
@@ -97,8 +102,12 @@ function flash(text) {
 
 async function showCacheInfo() {
   const info = await chrome.runtime.sendMessage({ type: 'cache-info' }).catch(() => null);
+  if (!info || typeof info.size !== 'number') {
+    els['cache-info'].textContent = '';
+    return;
+  }
   els['cache-info'].textContent =
-    info && typeof info.size === 'number' ? 'в кэше товаров: ' + info.size : '';
+    'в кэше товаров: ' + info.size + (info.error ? ' · ' + info.error : '');
 }
 
 async function runTest() {

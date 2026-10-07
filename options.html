@@ -20,7 +20,7 @@
     button { padding: 8px 16px; border-radius: 6px; border: 1px solid #d0d5dd; background: #f2f4f7; cursor: pointer; font-size: 14px; }
     button.primary { background: #175cd3; border-color: #175cd3; color: #fff; }
     #save-msg { color: #12b76a; font-weight: 600; }
-    pre#test-out { background: #f2f4f7; border-radius: 6px; padding: 10px; font-size: 12px; white-space: pre-wrap; word-break: break-word; min-height: 40px; }
+    pre#test-out { background: #f2f4f7; border-radius: 6px; padding: 10px; font-size: 12px; white-space: pre-wrap; word-break: break-word; min-height: 40px; max-height: 320px; overflow: auto; }
     .test-row { display: flex; gap: 8px; }
     .test-row input { flex: 1; }
     .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; vertical-align: baseline; }
@@ -47,9 +47,12 @@
   </fieldset>
 
   <fieldset>
-    <legend>Продовольственные категории</legend>
-    <div class="hint">Верхние категории товаров, которые оцениваем (одно на строку, совпадение подстроки). Товар из другой категории будет помечен «не продукты». Если категорию определить не удалось — товар оценивается.</div>
+    <legend>Категории товаров</legend>
+    <div class="hint">Товар оценивается всегда, кроме разделов из второго списка (совпадение подстроки в верхней категории товара). Если категорию определить не удалось — товар тоже оценивается: пропущенный товар хуже лишнего анализа.</div>
+    <label>Продовольственные разделы (подсказка, ничего не отсекает)</label>
     <textarea id="foodCategories" rows="3"></textarea>
+    <label style="margin-top:10px">Непищевые разделы (товары отсюда не оцениваются)</label>
+    <textarea id="nonFoodCategories" rows="3"></textarea>
   </fieldset>
 
   <fieldset>
@@ -69,10 +72,10 @@
     <legend>Фильтры совпадений</legend>
     <label>Слова-исключения (отменяют совпадение рядом с собой)</label>
     <textarea id="excludes" rows="2"></textarea>
-    <div class="hint">Например «без сахара», «сахарозаменитель».</div>
+    <div class="hint">Например «без сахара», «сахар-заменитель». Слово из 5 и более букв сравнивается и по началу, поэтому «замен» ловит «заменитель», «заменители», «заменителей».</div>
     <label style="margin-top:10px">Контекстные слова (вкус/аромат, а не состав)</label>
     <textarea id="contextExcludes" rows="2"></textarea>
-    <div class="hint">Совпадение рядом с этими словами не считается: так отсеиваются вкусо-ароматические описания («медовые ноты», «привкус мёда») и похожие названия («сахарный колер» — это краситель). Слово ищется как отдельное слово, а не внутри других («ра-зно-травье» — не «ноты»), и действует только внутри одного пункта состава: «сахар, краситель сахарный колер» — сахар останется.</div>
+    <div class="hint">Совпадение рядом с этими словами не считается: так отсеиваются вкусо-ароматические описания («медовые ноты», «привкус мёда») и похожие названия («сахарный колер» — это краситель, «меди сульфат» — минерал). Одно слово ищется по основе, фраза с пробелом — как есть, запись вида <b>/выражение/</b> — как регулярное выражение (например /мед[ьин]/ ловит «меди», «медный», но не «медовый»). Действует только внутри одного пункта состава: «сахар, краситель сахарный колер» — сахар останется.</div>
   </fieldset>
 
   <fieldset>
@@ -99,6 +102,11 @@
       <button id="clear-cache">Очистить кэш</button>
       <span id="cache-info" class="hint"></span>
     </div>
+  </fieldset>
+
+  <fieldset>
+    <legend>Проверка перед выпуском</legend>
+    <div class="hint">Регрессионные тесты лежат <b>вне расширения</b> — в папке <b>tests</b> в корне проекта, рядом со скриптом публикации. Запуск одной командой: <b>node tests/run.cjs</b> — она прогоняет юнит-тесты и разбирает сохранённые карточки из <b>tests/cases.json</b>. Добавлять новый случай нужно туда же: в публикуемый пакет тестовые файлы не попадают.</div>
   </fieldset>
 
   <div class="actions">

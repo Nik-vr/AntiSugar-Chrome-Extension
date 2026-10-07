@@ -14,17 +14,10 @@ document.addEventListener('DOMContentLoaded', async () => {
     copy: document.getElementById('copy')
   };
 
-  const ZONE_SHORT = {
-    red: 'Высокий риск',
-    orange: 'Скрытые угрозы',
-    yellow: 'Компромиссы',
-    green: 'Безопасно'
-  };
-  const SOURCE_LABEL = {
-    'состав': 'блок «Состав»',
-    'описание': 'блок «Описание»',
-    'страница': 'текст страницы'
-  };
+  // Подписи зон и источников — общие с content script (defaults.js),
+  // чтобы одинаковые надписи не расходились в двух файлах
+  const ZONE_SHORT = ASG_ZONE_SHORT;
+  const SOURCE_LABEL = ASG_SOURCE_LABEL;
 
   const settings = await chrome.storage.local.get(ASG_DEFAULTS);
   els.enabled.checked = !!settings.enabled;
@@ -155,13 +148,24 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (s.skipped) {
       els.pill.className = 'pill b-gray';
       els.pill.textContent = 'Не продукты';
-      els.rSource.textContent = 'категория «' + (s.reason || '?') + '»';
+      els.rSource.textContent =
+        s.skipKind === 'material'
+          ? 'состав материала — не продукт питания'
+          : 'категория «' + (s.reason || '?') + '»';
       els.rCache.textContent = s.cached ? 'да' : 'нет';
       els.rowZones.style.display = 'none';
       return;
     }
-    els.pill.className = 'pill b-' + (s.zone || 'gray');
-    els.pill.textContent = ZONE_SHORT[s.zone] || s.zone;
+    // Как и значок на странице: цвет показываем только когда вердикт получен
+    // по настоящему блоку «Состав», иначе — серая плашка с той же подписью
+    if (s.authoritative !== true) {
+      els.pill.className = 'pill b-gray';
+      els.pill.textContent =
+        s.source === 'состав' ? 'Состав не подтверждён' : 'Состав не найден';
+    } else {
+      els.pill.className = 'pill b-' + (s.zone || 'gray');
+      els.pill.textContent = ZONE_SHORT[s.zone] || s.zone;
+    }
     els.rSource.textContent = SOURCE_LABEL[s.source] || s.source || '—';
     els.rCache.textContent = s.cached ? 'да' : 'нет';
     const words = (s.matches || [])

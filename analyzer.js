@@ -2,26 +2,33 @@
 
 const ASG_ZONES = ['red', 'orange', 'yellow', 'green'];
 
+// Чем меньше ранг, тем опаснее зона
+const ASG_ZONE_RANK = { red: 0, orange: 1, yellow: 2, green: 3 };
+
 function asgNorm(t) {
   return String(t || '')
     // невидимые символы внутри слов ломают и сопоставление ключевых слов,
     // и границу слова: убираем на входе
     .replace(/[\u00AD\u200B-\u200D\u2060\uFEFF]/g, '')
+    .toLowerCase()
+    // «E 952», «Е-952», «(E–952)» → «e952»: код добавки пишут с разделителем,
+    // и без нормализации поиск по ключевым словам его не находил.
+    // Разделитель внутри слова не склеиваем: «изделие 500» не станет «изделие500».
+    .replace(/(^|[^a-zа-яё0-9])[eе]\s*[-–—]?\s*(\d{3})(?!\d)/g, '$1e$2')
     .replace(/\s+/g, ' ')
-    .trim()
-    .toLowerCase();
+    .trim();
 }
 
 // Транслитация похожих символов (Е952/е952 -> e952), чтобы поиск E-кодов
 // не зависел от кириллицы/латиницы. Замещения 1:1 — индексы сохраняются.
+// Один проход с картой вместо цепочки replace: функцию вызывают постоянно,
+// и шесть промежуточных строк на каждый выход — заметная часть работы
+// анализатора на тексте страницы.
+const ASG_TRANSLIT_MAP = { а: 'a', е: 'e', о: 'o', с: 'c', р: 'p', в: 'b' };
+const ASG_TRANSLIT_RE = /[аеосрв]/g;
+
 function asgTranslit(t) {
-  return t
-    .replace(/а/g, 'a')
-    .replace(/е/g, 'e')
-    .replace(/о/g, 'o')
-    .replace(/с/g, 'c')
-    .replace(/р/g, 'p')
-    .replace(/в/g, 'b');
+  return t.replace(ASG_TRANSLIT_RE, (ch) => ASG_TRANSLIT_MAP[ch]);
 }
 
 // Слова выделяем регуляркой, а не по пробелам: в составе на Ozon пишут
@@ -35,6 +42,25 @@ const ASG_WORD_RE = /[a-zа-яё0-9]+/gi;
 const ASG_NEG_WORD = asgTranslit('не');
 const ASG_HAS_VERBS = ['содерж', 'содержащ', 'имеет'].map((w) => asgTranslit(w));
 
+// Слово-исключение из 5 и более букв сравнивается и по началу слова: так
+// «заменитель» ловит «заменители», «заменителей», а корень «замен» — все
+// «заменител…». Короткие слова («без») сравниваются строго, иначе «безвредный
+// сахар» погасил бы настоящее совпадение.
+const ASG_MIN_PREFIX_EXCLUDE = 5;
+
+// Связка внутри одного слова: дефис, тире, косая черта, вертикальная черта.
+// Пробел и запятая сюда не входят намеренно — они отделяют следующий
+// компонент состава, а не этот.
+const ASG_NEG_SEPARATOR_RE = /[-–—/\\|]/;
+
+function asgExcludeWordHit(word, excludes) {
+  for (const e of excludes) {
+    if (word === e) return true;
+    if (e.length >= ASG_MIN_PREFIX_EXCLUDE && word.indexOf(e) === 0) return true;
+  }
+  return false;
+}
+
 // Отрицание перед совпадением: «без сахара», «без добавленного сахара»,
 // «без сахара и мёда». Проверяем до трёх слов непосредственно перед совпадением
 // и до границы фразы (запятая/точка с запятой). Широкий коридор был плох тем, что
@@ -47,9 +73,7 @@ function asgNegatedBefore(t, start, excludes) {
   if (cut !== -1) prefix = prefix.slice(cut + 1);
   const words = (prefix.match(ASG_WORD_RE) || []).slice(-3);
   for (const w of words) {
-    for (const e of excludes) {
-      if (w === e) return true;
-    }
+    if (asgExcludeWordHit(w, excludes)) return true;
   }
   // «не содержит сахара» — отрицание с глаголом перед совпадением
   for (let i = 0; i + 1 < words.length; i++) {
@@ -61,22 +85,42 @@ function asgNegatedBefore(t, start, excludes) {
   return false;
 }
 
-// Отрицание сразу после совпадения, внутри того же слова: «сахар|озаменитель».
-// Смотрим только остаток текущего слова, иначе «фиников без добавления сахара»
-// погасило бы «финик» из-за соседней фразы.
+// Отрицание сразу после совпадения: «сахар-заменитель», «сахар / заменитель».
+// Совпадение всегда заканчивается на границе слова, поэтому «сахарозаменитель»
+// сюда не попадает — его отсекает ограничение на длину окончания
+// (ASG_MAX_ENDING).
+// Связкой считаем только дефис, тире, косую и вертикальную черту (пробелы рядом
+// с ними допустимы). Голый пробел и запятая — это уже следующий компонент: в
+// «фиников без сахара» «без» относится к сахару, а «финики» обязаны остаться.
 function asgNegatedAfter(t, end, excludes) {
   if (!excludes.length) return false;
   let j = end;
-  while (j < t.length && /[a-zа-я0-9]/.test(t[j])) j++;
-  const rest = t.slice(end, j);
-  if (!rest) return false;
-  return excludes.some((e) => rest.includes(e));
+  while (j < t.length && ASG_WORD_CHAR.test(t[j])) j++;
+  let p = j;
+  while (p < t.length && /\s/.test(t[p])) p++;
+  if (p >= t.length || !ASG_NEG_SEPARATOR_RE.test(t[p])) return false;
+  let k = p;
+  while (k < t.length && (ASG_NEG_SEPARATOR_RE.test(t[k]) || /\s/.test(t[k]))) k++;
+  let m = k;
+  while (m < t.length && ASG_WORD_CHAR.test(t[m])) m++;
+  const next = t.slice(k, m);
+  if (!next) return false;
+  return asgExcludeWordHit(next, excludes);
 }
 
 // Отрицание, стоящее после совпадения: «мёда в составе нет», «сахара не содержит».
 // «без» сюда намеренно не входит: в связке «мёд без сахара» оно относится
 // к сахару, а не к мёду.
-const ASG_POST_NEGATIONS = ['нет', 'нету', 'не', 'отсутствует', 'отсутств', 'исключен', 'исключён'];
+// Голое «не» тоже не входит: «аспартам не рекомендуется детям» — это не
+// отрицание наличия. Из «не» признаётся только связка с глаголом наличия.
+const ASG_POST_NEGATIONS = ['нет', 'нету', 'отсутствует', 'отсутств', 'исключен', 'исключён'];
+
+const ASG_POST_NEG_VERBS = ['содерж', 'содержащ', 'имеет', 'обнаруж', 'найден', 'использ'];
+
+// Текст в анализе транслитерирован, значит и списки должны быть в той же форме.
+// Считаем один раз: раньше это выполнялось на каждое совпадение.
+const ASG_POST_NEGATIONS_T = ASG_POST_NEGATIONS.map((w) => asgTranslit(w));
+const ASG_POST_NEG_VERBS_T = ASG_POST_NEG_VERBS.map((w) => asgTranslit(w));
 
 function asgNegatedAfterWords(t, end) {
   let tail = t.slice(end, end + 48);
@@ -89,9 +133,14 @@ function asgNegatedAfterWords(t, end) {
   if (cut >= 0) tail = tail.slice(0, cut);
   const words = (tail.match(ASG_WORD_RE) || []).slice(0, 4);
   if (!words.length) return false;
-  // текст транслитерирован, значит и список отрицаний должен быть в той же форме
-  const normalized = ASG_POST_NEGATIONS.map((w) => asgTranslit(w));
-  return words.some((w) => normalized.includes(w) || ASG_POST_NEGATIONS.includes(w));
+  if (words.some((w) => ASG_POST_NEGATIONS_T.includes(w))) return true;
+  for (let i = 0; i + 1 < words.length; i++) {
+    if (words[i] !== ASG_NEG_WORD) continue;
+    for (const v of ASG_POST_NEG_VERBS_T) {
+      if (words[i + 1].indexOf(v) === 0) return true;
+    }
+  }
+  return false;
 }
 
 // Совпадение должно начинаться на границе слова.
@@ -194,30 +243,100 @@ function asgSpansForStems(t, stems) {
 // Исключение относится только к тому компоненту, где найдено совпадение:
 // «сахар, краситель сахарный колер» — сахар тут настоящий, а «сахарный колер»
 // относится к красителю в соседнем пункте.
+// Радиус ограничен: в тексте без запятых сегментом становилась вся страница,
+// и одно слово в её конце гасило все совпадения.
+const ASG_SEGMENT_RADIUS = 120;
+
 function asgSegment(t, start, end) {
   let from = start;
-  while (from > 0 && !/[,;:.!?()«"]/.test(t[from - 1])) from--;
+  const minFrom = Math.max(0, start - ASG_SEGMENT_RADIUS);
+  while (from > minFrom && !/[,;:.!?()«"]/.test(t[from - 1])) from--;
   let to = end;
-  while (to < t.length && !/[,;:.!?()«"]/.test(t[to])) to++;
+  const maxTo = Math.min(t.length, end + ASG_SEGMENT_RADIUS);
+  while (to < maxTo && !/[,;:.!?()«"]/.test(t[to])) to++;
   return t.slice(from, to);
 }
 
 // Контекстные слова должны быть словами, а не подстроками: «нот» означает
 // вкусовые ноты, но подстрока «нот» сидит внутри «ра-зно-травье» и гасит
 // настоящие совпадения («мёд луговой (разнотравье)»). Однословные правила
-// ищем с начала слова и без нового корня, многословные — как фразы.
+// ищем с начала слова и без нового корня, многословные — как фразы,
+// /выражение/ — как регулярное выражение по тому же (транслитерированному) тексту.
 function asgContextBlocked(t, start, end, cx) {
   const segment = asgSegment(t, start, end);
   for (const c of cx) {
+    if (c.re) {
+      if (c.re.test(segment)) return true;
+      continue;
+    }
     if (c.phrase) {
       if (segment.includes(c.phrase)) return true;
       continue;
     }
-    const at = asgFindInWindow(segment, c.word, 0, segment.length);
-    if (at !== -1) return true;
+    for (const w of c.words || []) {
+      if (asgFindInWindow(segment, w, 0, segment.length) !== -1) return true;
+    }
   }
   return false;
 }
+
+// Сколько первых букв основы искать как отдельный вариант. Нужно для слов
+// с беглой гласной: основа «углеводов» не входит в «углеводы», а «углев» — входит.
+const ASG_CONTEXT_PREFIX = 5;
+
+function asgContextEntry(raw) {
+  const e = asgNorm(raw);
+  if (!e) return null;
+  if (e.length > 2 && e[0] === '/' && e[e.length - 1] === '/') {
+    // текст для проверки транслитерирован, поэтому и выражение переводим
+    // в ту же форму: кириллическое «е» → латинское «e»
+    try {
+      return { re: new RegExp(asgTranslit(e.slice(1, -1)), 'i') };
+    } catch (err) {
+      return null;
+    }
+  }
+  if (e.indexOf(' ') !== -1) return { phrase: asgTranslit(e) };
+  const stem = asgWordStem(e);
+  if (!stem) return null;
+  const head = stem.slice(0, ASG_CONTEXT_PREFIX);
+  const words = head && head !== stem ? [stem, head] : [stem];
+  return { words };
+}
+
+// Подготовка правил анализа по настройкам (собирается один раз).
+// Ключевые слова идут от опасных зон к безопасным: при равных совпадениях
+// порядок влияет на то, какая запись победит в asgCollect, и он должен быть
+// предсказуемым.
+function asgPrepare(settings) {
+  if (asgPrepCache && asgPrepCache.settings === settings) return asgPrepCache;
+  const zdef = (settings && settings.zones) || {};
+  const keywords = [];
+  for (const z of ASG_ZONES) {
+    for (const raw of zdef[z] || []) {
+      const disp = asgNorm(raw);
+      if (!disp) continue;
+      const stems = asgKeywordStems(disp);
+      if (!stems.length) continue;
+      keywords.push({ disp, stems, zone: z });
+    }
+  }
+  const ex = ((settings && settings.excludes) || [])
+    .map((e) => asgTranslit(asgNorm(e)))
+    .filter(Boolean);
+  const cx = ((settings && settings.contextExcludes) || [])
+    .map(asgContextEntry)
+    .filter(Boolean);
+  asgPrepCache = { settings, keywords, ex, cx };
+  return asgPrepCache;
+}
+
+// Подготовленные правила для анализа: основы ключевых слов, слова-исключения,
+// контекстные правила. Собираются один раз на набор настроек — иначе на каждый
+// вызов asgAnalyze заново считаются основы всех ~50 ключевых слов, нормализуются
+// списки и создаются регулярные выражения пользовательских правил.
+// Ключ кэша — сами настройки: при их смене меняется и ссылка на объект.
+let asgPrepCache = null;
 
 // Все вхождения ключевых слов с учётом фильтров.
 // Контекстные слова («ноты», «привкус») работают в широком окне: они указывают
@@ -225,39 +344,26 @@ function asgContextBlocked(t, start, end, cx) {
 function asgCollect(text, settings) {
   const src = asgNorm(text);
   const t = asgTranslit(src);
-  const zdef = (settings && settings.zones) || {};
-  const ex = ((settings && settings.excludes) || []).map((e) => asgTranslit(asgNorm(e))).filter(Boolean);
-  const cx = ((settings && settings.contextExcludes) || [])
-    .map((e) => asgNorm(e))
-    .filter(Boolean)
-    .map((e) => (e.indexOf(' ') === -1 ? { word: asgWordStem(e) } : { phrase: asgTranslit(e) }))
-    .filter((c) => c.word || c.phrase);
+  const prep = asgPrepare(settings);
   const occ = [];
 
-  for (const z of ASG_ZONES) {
-    for (const raw of zdef[z] || []) {
-      const kwDisp = asgNorm(raw);
-      if (!kwDisp) continue;
-      const stems = asgKeywordStems(kwDisp);
-      if (!stems.length) continue;
-      const spans = asgSpansForStems(t, stems);
-      for (const span of spans) {
-        const blocked =
-          asgContextBlocked(t, span.start, span.end, cx) ||
-          asgNegatedBefore(t, span.start, ex) ||
-          asgNegatedAfter(t, span.end, ex) ||
-          asgNegatedAfterWords(t, span.end);
-        if (!blocked) {
-          occ.push({
-            start: span.start,
-            end: span.end,
-            keyword: kwDisp,
-            zone: z,
-            // само найденное слово из исходного текста (транслитерация в отчёте
-            // нечитаема), нужно для разбора ложных срабатываний
-            word: src.slice(span.start, span.end)
-          });
-        }
+  for (const kw of prep.keywords) {
+    for (const span of asgSpansForStems(t, kw.stems)) {
+      const blocked =
+        asgContextBlocked(t, span.start, span.end, prep.cx) ||
+        asgNegatedBefore(t, span.start, prep.ex) ||
+        asgNegatedAfter(t, span.end, prep.ex) ||
+        asgNegatedAfterWords(t, span.end);
+      if (!blocked) {
+        occ.push({
+          start: span.start,
+          end: span.end,
+          keyword: kw.disp,
+          zone: kw.zone,
+          // само найденное слово из исходного текста (транслитерация в отчёте
+          // нечитаема), нужно для разбора ложных срабатываний
+          word: src.slice(span.start, span.end)
+        });
       }
     }
   }
@@ -265,15 +371,29 @@ function asgCollect(text, settings) {
   // Совпадение, полностью содержащееся в более длинном, отбрасываем:
   // «сахар» внутри «изомальтоолигосахарид» — это одно и то же слово,
   // а не сахар в составе. Правило действует между всеми зонами.
+  // Отрезки одинаковой длины не взаимно уничтожаются: остаётся одно вхождение —
+  // более специфичное слово («сахарин» вместо «сахар» при том же отрезке),
+  // при равной длине — из более опасной зоны. Иначе «медовый» давал две записи
+  // («мед» и «медов») и задвоенный счётчик.
   return occ.filter(
     (o) =>
-      !occ.some(
-        (o2) =>
-          o2 !== o &&
-          o2.start <= o.start &&
-          o2.end >= o.end &&
-          o2.end - o2.start > o.end - o.start
-      )
+      !occ.some((o2) => {
+        if (o2 === o) return false;
+        if (o2.start > o.start || o2.end < o.end) return false; // не содержит o
+        const lenO = o.end - o.start;
+        const lenO2 = o2.end - o2.start;
+        if (lenO2 > lenO) return true;
+        if (lenO2 < lenO) return false;
+        if (o2.start !== o.start) return false;
+        if (o2.keyword.length !== o.keyword.length) {
+          return o2.keyword.length > o.keyword.length;
+        }
+        const r2 = ASG_ZONE_RANK[o2.zone];
+        const r = ASG_ZONE_RANK[o.zone];
+        if (r2 !== r) return r2 < r;
+        // детерминированность: одинаковые записи не гасят друг друга
+        return String(o2.keyword) < String(o.keyword);
+      })
   );
 }
 
@@ -362,10 +482,6 @@ function asgSnippet(text, keyword, radius) {
   return (from > 0 ? '…' : '') + orig.slice(from, to) + (to < orig.length ? '…' : '');
 }
 
-// Продовольственная ли верхняя категория? Неизвестная категория — не блокируем.
-function asgIsFoodCategory(name, foodCategories) {
-  const n = asgNorm(name);
-  const cats = (foodCategories || []).map(asgNorm).filter(Boolean);
-  if (!n || !cats.length) return true;
-  return cats.some((c) => n.includes(c));
-}
+// Проверка продовольственной категории живёт в defaults.js
+// (asgCategoryDecision): её использует и content script, где analyzer.js
+// не подключён.
