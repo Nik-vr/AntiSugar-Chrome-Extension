@@ -40,6 +40,15 @@
   const ZONE_SHORT = ASG_ZONE_SHORT;
   const ZONE_ICON = ASG_ZONE_ICON;
 
+  // Зоны, компоненты из которых считаются проблемными: красная, оранжевая и
+  // жёлтая. Зелёная зона проблемой не является — стевия и подобное лишь
+  // подсвечены в самом составе.
+  //
+  // Список один на плашку и на панель. Раньше цифра на плашке складывалась по
+  // всем зонам, включая зелёную, а панель перечисляла только проблемные: на
+  // печенье «без сахара» плашка показывала 4, а в списке было 3 находки.
+  const PROBLEM_ZONES = ['red', 'orange', 'yellow'];
+
   let settings = null;
   const errors = [];
   let state = { status: 'idle' };
@@ -420,8 +429,11 @@
         cls = 'b-' + zone;
         label = ZONE_SHORT[zone];
       }
+      // Цифра на плашке — число проблемных компонентов, то же, что перечислено в
+      // панели. Зелёные находки сюда не входят: плашка подписана зоной риска
+      // («Скрытые угрозы»), и безопасный компонент к угрозам не относится.
       let total = 0;
-      for (const z of ZONE_ORDER) {
+      for (const z of PROBLEM_ZONES) {
         for (const m of (r.zones && r.zones[z]) || []) total += m.count;
       }
       count = total ? String(total) : '';
@@ -442,10 +454,8 @@
     // а повторялась она ещё и внизу панели. Пометку о кэше переносим вниз, к
     // прочим служебным пометкам, чтобы панель начиналась с сути.
 
-    // Проблемные компоненты — красная, оранжевая и жёлтая зоны. Зелёная зона
-    // проблемой не является: стевия и подобное подсвечены в самом составе.
-    const problemZones = ['red', 'orange', 'yellow'];
-    const hasProblems = problemZones.some(
+    // Проблемные компоненты — красная, оранжевая и жёлтая зоны (PROBLEM_ZONES).
+    const hasProblems = PROBLEM_ZONES.some(
       (z) => ((r.zones && r.zones[z]) || []).length > 0
     );
 
@@ -516,7 +526,7 @@
       // проблемные ингредиенты. Если находок нет, панель состоит только из
       // проверяемого состава — пустого заголовка быть не должно.
       lines.push('<div class="zh">На что обратить внимание:</div>');
-      for (const z of problemZones) {
+      for (const z of PROBLEM_ZONES) {
         const ms = (r.zones && r.zones[z]) || [];
         if (!ms.length) continue;
         lines.push('<div class="zh z-' + z + '">' + esc(ZONE_LABEL[z]) + '</div>');
@@ -1036,6 +1046,12 @@ function asgWeakComposition(e) {
         ingredientListLike: !!e.ingredientListLike,
         compositionLen: (e.composition || '').length,
         compositionPreview: (e.composition || '').slice(0, 300),
+        // Тот текст, который реально ушёл в анализ, целиком. Предпросмотра
+        // выше не хватает: он обрывается на 300 символах, а ложные
+        // срабатывания прятались в хвосте — приходилось угадывать, что там.
+        // Ограничение 4000 знаков: диагностику копируют вручную.
+        analyzedText: (state && state.text) || '',
+        analyzedLen: (state && state.textLength) || 0,
         descriptionLen: (e.description || '').length,
         descriptionPreview: (e.description || '').slice(0, 300),
         pageTextLen: (e.pageText || '').length,
