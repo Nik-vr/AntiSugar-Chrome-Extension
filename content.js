@@ -1027,6 +1027,9 @@ function asgWeakComposition(e) {
       // 'unknown' (раздел не опознан, но состав пищевой — так разбирают,
       // например батончики в разделе «Спорт и отдых»)
       foodDecision: (state && state.foodDecision) || null,
+      // на чём основан вывод «это еда», когда раздел не опознан: сколько
+      // найдено признаков еды в самом составе
+      foodEvidence: (state && state.foodEvidence) || null,
       extraction: {
         skipped: !!reason,
         hasComposition: !!e.hasComposition,

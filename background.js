@@ -153,6 +153,7 @@ function flushCache() {
 function cacheSignature(r) {
   if (!r) return '';
   return JSON.stringify([
+    r.rules || null,
     r.status,
     r.skipped,
     r.skipKind || null,
@@ -175,6 +176,10 @@ function cacheRecord(result) {
   const out = {
     url: result.url,
     status: result.status,
+    // версия правил разбора. Меняем список зон, исключений или логику — и
+    // поднимаем ASG_CFG_VERSION: тогда старые вердикты в кэше перестают
+    // использоваться, а не висят до ручной очистки.
+    rules: ASG_CFG_VERSION,
     skipped: !!result.skipped,
     source: result.source || null,
     authoritative: result.authoritative === true,
@@ -314,8 +319,20 @@ async function analyzeProduct(product) {
   const url = product.url;
   if (!product.force) {
     const hit = cache.get(url);
-    // записи без поля authoritative — из прежних версий, им не доверяем
-    if (hit && typeof hit.authoritative === 'boolean') return { ...withRisk(hit), cached: true };
+    // Запись без поля authoritative — из прежней версии расширения, ей не
+    // доверяем. Запись без поля rules — тоже: она посчитана по правилам, которых
+    // уже нет (например, до того как «еда или нет» стало определяться по
+    // структуре состава). Раньше такие записи молча возвращались, и товар не
+    // перепроверялся: правки в коде были, а на странице держался старый вердикт.
+    // Это выглядело так, будто исправление не сработало.
+    if (
+      hit &&
+      typeof hit.authoritative === 'boolean' &&
+      hit.rules === ASG_CFG_VERSION
+    ) {
+      return { ...withRisk(hit), cached: true };
+    }
+    if (hit) cache.delete(url);
   }
 
   const base = { url, status: 'ok', fetchedAt: Date.now() };
@@ -377,17 +394,28 @@ async function analyzeProduct(product) {
   // «Состав», в котором нашлись сахар или подсластители, доказывает, что перед
   // нами еда: батончики и протеиновые смеси на Ozon лежат в «Спорт и отдых»,
   // а косметика и одежда подсластителей в составе не содержат.
-  const foodByPage = !!(product.compositionTrusted === true && asgHasAnyMatch(res));
+  //
+  // Второе доказательство — структура самого состава. Без него товар без
+  // опасных веществ (протеиновое печенье без сахара) считался непродовольственным
+  // и пропускался целиком: отсутствие вредного не означает отсутствие еды.
+  //
+  // Доказательство по структуре сильнее: раздел вне обоих списков ничем не лучше
+  // — он просто не опознан, — и доверять ему нельзя так же, как содержимому.
+  const foodEvidence = asgFoodByComposition(pick.text);
+  const foodByComposition = product.compositionTrusted === true && foodEvidence.food;
+  const foodByPage =
+    product.compositionTrusted === true && asgHasAnyMatch(res) && !foodByComposition;
   if (
     product.topCategoryReliable !== false &&
     categoryDecision !== 'food' &&
-    !foodByPage
+    !foodByPage &&
+    !foodByComposition
   ) {
     const result = skipped('category', topCategory || 'раздел не опознан');
     cacheSet(url, result);
     return { ...result, cached: false };
   }
-  const foodDecision = foodByPage ? 'food' : categoryDecision;
+  const foodDecision = foodByPage || foodByComposition ? 'food' : categoryDecision;
 
   // Источник — настоящий блок «Состава» (подпись, селектор, контейнер,
   // состояние страницы), даже если перечень не прошёл проверку завершённости.
@@ -415,6 +443,8 @@ async function analyzeProduct(product) {
     // решение о том, еда ли товар: 'food' — по разделу или по составу,
     // 'unknown' — раздел не опознан, но состав пищевой (видно в диагностике)
     foodDecision,
+    // на чём основан вывод «это еда» для неопознанного раздела — видно в отчёте
+    foodEvidence,
     source: pick.source,
     complete,
     authoritative,
@@ -529,7 +559,10 @@ async function analyzeUrl(url, force) {
 
   if (!force) {
     const hit = cache.get(url);
-    if (hit && typeof hit.authoritative === 'boolean') return { ...withRisk(hit), cached: true };
+    if (hit && typeof hit.authoritative === 'boolean' && hit.rules === ASG_CFG_VERSION) {
+      return { ...withRisk(hit), cached: true };
+    }
+    if (hit) cache.delete(url);
   }
   if (loaderBusy) return { url, status: 'error', error: 'Страница уже загружается' };
 
