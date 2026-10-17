@@ -69,7 +69,9 @@
   let watching = false;
   let pollTimer = null;
   let mutationObserver = null;
+  let mutationObserverBody = null;
   let mutationTimer = null;
+  let lateObserverTimer = null;
   let lastRenderedConfirmed = null;
   let lastPanel = false;
   let lastFinal = false;
@@ -204,15 +206,32 @@
     return bodyLen;
   }
   function bodyLenApply(records) {
+    const charChanges = new Map();
+    const changedRoots = [];
     for (const rec of records) {
+      if (rec.type === 'characterData') {
+        if (!charChanges.has(rec.target)) charChanges.set(rec.target, rec.oldValue || '');
+        continue;
+      }
       for (const n of rec.addedNodes || []) {
         if (n.nodeType === 1 && n.hasAttribute && n.hasAttribute(BADGE_ATTR)) continue;
+        changedRoots.push(n);
         bodyLen += (n.textContent || '').length;
       }
       for (const n of rec.removedNodes || []) {
         if (n.nodeType === 1 && n.hasAttribute && n.hasAttribute(BADGE_ATTR)) continue;
+        changedRoots.push(n);
         bodyLen -= (n.textContent || '').length;
       }
+    }
+    // Для изменения текстового узла берём разницу длин, не перечитывая весь
+    // body. Если узел в этой же пачке был добавлен/удалён, его текст уже учтён
+    // соответствующей childList-записью.
+    for (const [node, oldValue] of charChanges) {
+      if (changedRoots.some((root) => root === node || (root.contains && root.contains(node)))) {
+        continue;
+      }
+      bodyLen += (node.nodeValue || '').length - oldValue.length;
     }
     return bodyLen;
   }
@@ -824,41 +843,70 @@
   // прекращался вместе с окном наблюдения, и такой состав не замечался никогда;
   // MutationObserver срабатывает ровно тогда, когда страница что-то дорисовала.
   function startObserver() {
-    if (mutationObserver || !document.body) return;
-    mutationObserver = new MutationObserver((records) => {
-      // Перерисовку собственного значка изменением страницы не считаем
-      let ownOnly = true;
-      for (const rec of records) {
-        const nodes = [];
-        if (rec.addedNodes) for (const n of rec.addedNodes) nodes.push(n);
-        if (rec.removedNodes) for (const n of rec.removedNodes) nodes.push(n);
-        if (!nodes.length) {
-          ownOnly = false;
-          break;
+    const body = document.body;
+    if (!body) return;
+    if (mutationObserver && mutationObserverBody !== body) stopObserver();
+    if (!mutationObserver) {
+      mutationObserver = new MutationObserver((records) => {
+        // Перерисовку собственного значка изменением страницы не считаем
+        let ownOnly = true;
+        for (const rec of records) {
+          const nodes = [];
+          if (rec.addedNodes) for (const n of rec.addedNodes) nodes.push(n);
+          if (rec.removedNodes) for (const n of rec.removedNodes) nodes.push(n);
+          if (!nodes.length) {
+            ownOnly = false;
+            break;
+          }
+          for (const n of nodes) {
+            if (n.nodeType === 1 && n.hasAttribute && n.hasAttribute(BADGE_ATTR)) continue;
+            ownOnly = false;
+            break;
+          }
+          if (!ownOnly) break;
         }
-        for (const n of nodes) {
-          if (n.nodeType === 1 && n.hasAttribute && n.hasAttribute(BADGE_ATTR)) continue;
-          ownOnly = false;
-          break;
-        }
-        if (!ownOnly) break;
+        if (ownOnly) return;
+        bodyLenApply(records);
+        if (mutationTimer) return;
+        mutationTimer = setTimeout(() => {
+          mutationTimer = null;
+          onDomChanged();
+        }, MUTATION_DEBOUNCE_MS);
+      });
+      try {
+        mutationObserver.observe(body, {
+          childList: true,
+          subtree: true,
+          characterData: true,
+          characterDataOldValue: true
+        });
+        mutationObserverBody = body;
+      } catch (e) {
+        mutationObserver = null;
+        mutationObserverBody = null;
       }
-      if (ownOnly) return;
-      bodyLenApply(records);
-      if (mutationTimer) return;
-      mutationTimer = setTimeout(() => {
-        mutationTimer = null;
-        onDomChanged();
-      }, MUTATION_DEBOUNCE_MS);
-    });
-    try {
-      mutationObserver.observe(document.body, { childList: true, subtree: true });
-    } catch (e) {
-      mutationObserver = null;
+    }
+    // Наблюдатель нужен и после закрытия короткого окна опроса, чтобы заметить
+    // поздний состав, но после LATE_WATCH_MS отключаем его независимо от того,
+    // продолжает ли страница активно менять DOM.
+    if (lateObserverTimer) clearTimeout(lateObserverTimer);
+    const remaining = Math.max(0, lateWatchUntil - Date.now());
+    lateObserverTimer = setTimeout(() => {
+      lateObserverTimer = null;
+      if (Date.now() >= lateWatchUntil) stopObserver();
+    }, remaining);
+    // В браузере таймер возвращает число. В Node/jsdom — Timeout, который не
+    // должен удерживать тестовый процесс открытым пять минут.
+    if (lateObserverTimer && typeof lateObserverTimer.unref === 'function') {
+      lateObserverTimer.unref();
     }
   }
 
   function stopObserver() {
+    if (lateObserverTimer) {
+      clearTimeout(lateObserverTimer);
+      lateObserverTimer = null;
+    }
     if (mutationTimer) {
       clearTimeout(mutationTimer);
       mutationTimer = null;
@@ -867,6 +915,7 @@
       mutationObserver.disconnect();
       mutationObserver = null;
     }
+    mutationObserverBody = null;
   }
 
   // Страница что-то дорисовала. Реагируем не чаще, чем раз в REACT_MIN_MS.

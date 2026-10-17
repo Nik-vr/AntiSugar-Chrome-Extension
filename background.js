@@ -7,6 +7,7 @@ importScripts('defaults.js', 'analyzer.js', 'extractor.js', 'components.js');
 
 const CACHE_LIMIT = 1500; // максимум товаров в кэше
 const CACHE_KEY = 'asgCache';
+const CACHE_TTL_MS = 24 * 60 * 60 * 1000; // перечитываем карточку хотя бы раз в сутки
 const CACHE_FLUSH_MS = 1000; // как часто дописываем кэш на диск
 const TAB_RENDER_WAIT = 900; // пауза после парсинга DOM в скрытой вкладке
 const TAB_TIMEOUT = 30000;
@@ -175,6 +176,7 @@ function cacheRecord(result) {
     (list || []).map((m) => ({ keyword: m.keyword, count: m.count, word: m.word, name: m.name }));
   const out = {
     url: result.url,
+    cachedAt: Date.now(),
     status: result.status,
     // версия правил разбора. Меняем список зон, исключений или логику — и
     // поднимаем ASG_CFG_VERSION: тогда старые вердикты в кэше перестают
@@ -241,8 +243,14 @@ function cacheSet(url, result) {
   const prev = cache.get(url);
   // Подпись считаем от записи кэша, а не от полного результата: в записи нет
   // описаний рисков, и сравнение разных форм всегда считало бы вердикт новым
-  if (prev && cacheSignature(prev) === cacheSignature(record)) {
-    // вердикт тот же — не пишем на диск и не поднимаем onChanged
+  if (
+    prev &&
+    cacheSignature(prev) === cacheSignature(record) &&
+    Number.isFinite(prev.cachedAt) &&
+    record.cachedAt - prev.cachedAt < CACHE_TTL_MS
+  ) {
+    // Вердикт тот же и запись ещё свежая — не пишем на диск и не поднимаем onChanged.
+    // Просроченная запись должна получить новую дату даже при неизменном вердикте.
     return;
   }
   cache.set(url, record);
@@ -327,6 +335,8 @@ async function analyzeProduct(product) {
     // Это выглядело так, будто исправление не сработало.
     if (
       hit &&
+      Number.isFinite(hit.cachedAt) &&
+      Date.now() - hit.cachedAt < CACHE_TTL_MS &&
       typeof hit.authoritative === 'boolean' &&
       hit.rules === ASG_CFG_VERSION
     ) {
@@ -495,6 +505,7 @@ function htmlFromTab(url) {
   return new Promise((resolve, reject) => {
     let tabId = null;
     let settled = false;
+    let renderStarted = false;
     const finish = (err, html) => {
       if (settled) return;
       settled = true;
@@ -509,7 +520,11 @@ function htmlFromTab(url) {
       else resolve(html);
     };
     const onUpdated = (tid, info) => {
-      if (tid !== tabId || info.status !== 'interactive') return;
+      // chrome.tabs сообщает только "loading" и "complete"; "interactive" —
+      // это document.readyState, а не статус вкладки. Ожидание его здесь
+      // оставляло fallback только на 30-секундный таймаут.
+      if (tid !== tabId || info.status !== 'complete' || renderStarted) return;
+      renderStarted = true;
       setTimeout(async () => {
         try {
           const [inj] = await chrome.scripting.executeScript({
@@ -517,7 +532,7 @@ function htmlFromTab(url) {
             func: () => document.documentElement.outerHTML
           });
           const html = (inj && inj.result) || '';
-          if (html.length < 500) finish(new Error('Страница не загрузилась'));
+          if (html.length < MIN_PAGE_HTML) finish(new Error('Страница не загрузилась'));
           else finish(null, html);
         } catch (e) {
           finish(e instanceof Error ? e : new Error(String(e)));
@@ -533,6 +548,9 @@ function htmlFromTab(url) {
       .create({ url, active: false })
       .then((tab) => {
         tabId = tab.id;
+        // Если вкладка успела загрузиться до установки tabId, событие могло
+        // прийти раньше обработчика. Учитываем и статус из ответа create.
+        if (tab.status === 'complete') onUpdated(tabId, { status: 'complete' });
       })
       .catch((e) => finish(new Error('Не удалось открыть вкладку: ' + e)));
   });
@@ -559,7 +577,13 @@ async function analyzeUrl(url, force) {
 
   if (!force) {
     const hit = cache.get(url);
-    if (hit && typeof hit.authoritative === 'boolean' && hit.rules === ASG_CFG_VERSION) {
+    if (
+      hit &&
+      Number.isFinite(hit.cachedAt) &&
+      Date.now() - hit.cachedAt < CACHE_TTL_MS &&
+      typeof hit.authoritative === 'boolean' &&
+      hit.rules === ASG_CFG_VERSION
+    ) {
       return { ...withRisk(hit), cached: true };
     }
     if (hit) cache.delete(url);

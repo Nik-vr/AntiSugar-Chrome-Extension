@@ -121,9 +121,10 @@ function asgIsEmptyComposition(t) {
 // Хвост из рекламы и условий хранения, который Ozon ставит следом за перечнем
 // вкусов: «Условия хранения: … Участвуйте в акции магазина: скидка 20%».
 // Обрезаем его: одна рекламная строка отбрасывала весь перечень — и по причине
-// «похоже на рекламу». Ни одно из этих слов в составе ингредиентов не встречается.
+// «похоже на рекламу». Маркеры распознаются как отдельные слова: подстрока
+// «акци» внутри ингредиента «фракционированное» не является рекламой.
 const ASG_PROMO_TAIL =
-  /(отзыв|рекоменд|услови\s+хранения|хранени|гарант|доставк|акци|скидк|промокод|купон|бонус|распродаж|участвуйте|отзывы)/i;
+  /(?<![\p{L}])(?:отзыв\p{L}*|рекоменд\p{L}*|услови\p{L}*\s+хранени\p{L}*|хранени\p{L}*|гарант\p{L}*|доставк\p{L}*|акци\p{L}*|скидк\p{L}*|промокод\p{L}*|купон\p{L}*|бонус\p{L}*|распродаж\p{L}*|участвуйте)(?![\p{L}])/iu;
 
 // Хвост с пищевой ценностью: Ozon дописывает его следом за перечнем ингредиентов
 // («Содержание (расчётное) в 100 г: …, общего сахара 2,0 г»). Это не состав:
@@ -468,6 +469,26 @@ const ASG_MAX_LABEL_CHILDREN = 40;
 function asgElementText(el) {
   if (!el) return null;
   if (el.childElementCount > ASG_MAX_LABEL_CHILDREN) return null;
+  if (el.childElementCount > 0) {
+    // Контейнеры, внутри которых нет собственного текста, обычно содержат
+    // множество уже проверяемых дочерних узлов. Их textContent многократно
+    // обходил одни и те же поддеревья на больших страницах.
+    let ownText = '';
+    for (const child of el.childNodes) {
+      if (child.nodeType === 3) ownText += child.nodeValue || '';
+    }
+    const own = asgCollapse(ownText);
+    if (
+      !own ||
+      !/^(?:состав|ингредиент|ingredients?|composition|описани[ея]|description|материал|ткань)/i.test(own)
+    ) {
+      return null;
+    }
+    // Только небольшие потенциальные подписи с вложенной разметкой требуют
+    // сборки полного текста; значения длиннее лимита всё равно не принимаются.
+    const text = el.textContent || '';
+    return text.length <= ASG_MAX_VALUE ? text : null;
+  }
   const first = el.firstChild;
   if (first && first.nodeType === 3 && !first.nextSibling) {
     // один текстовый узел — самый частый случай, поддерево не обходим
@@ -731,6 +752,8 @@ function asgJsonLdTexts(doc) {
 // состояние страницы часто хранит кириллицу именно в таком виде
 function asgScriptTexts(doc) {
   const out = [];
+  let total = 0;
+  const maxTotal = 1000000;
   let scripts;
   try {
     scripts = doc.querySelectorAll('script');
@@ -740,7 +763,10 @@ function asgScriptTexts(doc) {
   for (const s of scripts) {
     const t = s.textContent || '';
     if (!t) continue;
-    const capped = t.length > 400000 ? t.slice(0, 400000) : t;
+    const available = maxTotal - total;
+    if (available <= 0) break;
+    const capped = t.slice(0, Math.min(400000, available));
+    total += capped.length;
     out.push(
       capped.indexOf('\\u') !== -1
         ? capped.replace(/\\u([0-9a-fA-F]{4})/g, (m, h) =>
@@ -750,6 +776,32 @@ function asgScriptTexts(doc) {
     );
   }
   return out;
+}
+
+// Состояние товара бывает в inline-script и data/aria-атрибутах. Собираем эти
+// источники напрямую, не создавая сериализованную копию всего documentElement.
+function asgPageStateTexts(doc) {
+  const pools = asgScriptTexts(doc);
+  try {
+    const attributeTexts = [];
+    let total = 0;
+    const maxAttributes = 400000;
+    for (const el of doc.querySelectorAll('*')) {
+      for (const attr of el.attributes || []) {
+        if (!/^(?:data-|aria-|value$)/i.test(attr.name)) continue;
+        const left = maxAttributes - total;
+        if (left <= 0) break;
+        const text = (attr.value || '').slice(0, left);
+        if (text) {
+          attributeTexts.push(text);
+          total += text.length;
+        }
+      }
+      if (total >= maxAttributes) break;
+    }
+    if (attributeTexts.length) pools.push(attributeTexts.join(' '));
+  } catch (e) { /* ignore */ }
+  return pools;
 }
 
 // Состав из JSON-состояния страницы. Формы:
@@ -780,19 +832,10 @@ function asgCompositionFromSources(doc) {
     return null;
   };
 
-  // 1) Разметка целиком: состояние страницы лежит и в inline-скриптах, и в
-  //    data-атрибутах, поэтому innerHTML — самый полный источник.
-  let html = '';
-  try {
-    html = (doc.documentElement && doc.documentElement.innerHTML) || '';
-  } catch (e) { /* ignore */ }
-  const fromHtml = scan(html);
-  if (fromHtml) return fromHtml;
-
-  // 2) Только если разметка не дала результата — раскодируем \uXXXX в скриптах.
-  //    Это дорого (до 400 КБ на скрипт), а содержимое inline-скриптов уже было
-  //    в разметке: считаем второй раз только ради раскодированной кириллицы.
-  for (const t of asgScriptTexts(doc)) {
+  // Ищем состояние в самих script-текстах и атрибутах данных. Сериализация
+  // documentElement.innerHTML создавала мегабайтную копию всего DOM ради пяти
+  // регулярных выражений, хотя основной источник состояния — inline-скрипты.
+  for (const t of asgPageStateTexts(doc)) {
     const v = scan(t);
     if (v) return v;
   }
@@ -1099,14 +1142,15 @@ function asgProbeComposition(doc) {
     labeled: []
   };
 
-  let html = '';
+  let visible = '';
   try {
-    html = (doc.documentElement && doc.documentElement.innerHTML) || '';
+    visible = asgVisibleText(doc, 80000);
   } catch (e) { /* ignore */ }
-  if (!html) return out;
-
-  out.wordInHtml = /состав/i.test(html);
-  out.escapedInHtml = /\\u0?42[14]/i.test(html) && /\\u0?43/.test(html);
+  const stateTexts = asgPageStateTexts(doc);
+  out.wordInHtml = /состав/i.test(visible) || stateTexts.some((t) => /состав/i.test(t));
+  out.escapedInHtml = stateTexts.some(
+    (t) => /\\u0?42[14]/i.test(t) && /\\u0?43/.test(t)
+  );
   try {
     out.charContainers = doc.querySelectorAll(ASG_CHAR_CONTAINER_SEL).length;
   } catch (e) { /* ignore */ }
